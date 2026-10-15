@@ -855,7 +855,7 @@ class Trellis2MeshWithVoxelToTrimesh:
         return {
             "required": {
                 "mesh": ("MESHWITHVOXEL",),
-                "reorient_vertices":(["None","90 degrees","-90 degrees"],{"default":"90 degrees"}),
+                "reorient_vertices":(["None","90 degrees","-90 degrees","Pixal3D official"],{"default":"90 degrees"}),
             },
         }
 
@@ -875,6 +875,23 @@ class Trellis2MeshWithVoxelToTrimesh:
         elif reorient_vertices == '-90 degrees':
             vertices_np[:, 1], vertices_np[:, 2] = -vertices_np[:, 2], vertices_np[:, 1]
         
+        if reorient_vertices == 'Pixal3D official':
+            # Official Pixal3D output-frame conversion:
+            #
+            # x' = -x
+            # y' = -z
+            # z' = -y
+            #
+            # Equivalent to:
+            #
+            # [-1,  0,  0]
+            # [ 0,  0, -1]
+            # [ 0, -1,  0]
+            _src = vertices_np.copy()
+            vertices_np[:, 0] = -_src[:, 0]
+            vertices_np[:, 1] = -_src[:, 2]
+            vertices_np[:, 2] = -_src[:, 1]
+
         trimesh = Trimesh.Trimesh(
             vertices=vertices_np,
             faces=mesh_copy.faces.cpu().numpy(),

@@ -8,6 +8,59 @@ supporting camera-aware 3D-to-2D feature mapping.
 from typing import *
 import os
 import torch
+# AMD ROCm fallback: Upsample lr_features to target size (replaces NAF/natten).
+# Optional experimental high-freq image cue: set env TRELLIS2_NAF_SHARPEN=1 to enable.
+class _NAFBf16Wrapper(torch.nn.Module):
+    # Runs the real NAF in bf16 to halve activation memory (fixes the
+    # texture-stage full-image NAF OOM on 16GB). Output is cast back to fp32.
+    def __init__(self, naf):
+        super().__init__()
+        self.naf = naf.to(torch.bfloat16)
+    def forward(self, *args, **kwargs):
+        torch.cuda.empty_cache()
+        args = tuple(a.to(torch.bfloat16) if torch.is_tensor(a) and a.is_floating_point() else a for a in args)
+        out = self.naf(*args, **kwargs)
+        if torch.is_tensor(out):
+            return out.float()
+        if isinstance(out, (tuple, list)):
+            return type(out)(o.float() if torch.is_tensor(o) else o for o in out)
+        return out
+
+
+class DummyNAFModel(torch.nn.Module):
+    _proj = None
+    def forward(self, image_tile, lr_features_bchw, target_size):
+        if isinstance(target_size, (tuple, list)):
+            H_out, W_out = int(target_size[0]), int(target_size[1])
+        else:
+            H_out = W_out = int(target_size)
+        base = torch.nn.functional.interpolate(
+            lr_features_bchw, size=(H_out, W_out), mode='bilinear', align_corners=False
+        )
+        if os.environ.get("TRELLIS2_NAF_SHARPEN", "0") != "1":
+            return base
+        try:
+            C = base.shape[1]
+            img = torch.nn.functional.interpolate(
+                image_tile, size=(H_out, W_out), mode='bilinear', align_corners=False
+            )  # [B,3,H,W]
+            P = DummyNAFModel._proj
+            if P is None or P.shape[0] != C or P.device != base.device:
+                g = torch.Generator(device='cpu').manual_seed(1234)
+                P = (torch.randn(C, 3, generator=g) * 0.15).to(base.device, base.dtype)
+                DummyNAFModel._proj = P
+            hi = torch.nn.functional.conv2d(img, P.unsqueeze(-1).unsqueeze(-1))  # [B,C,H,W]
+            return base + hi
+        except Exception as _e:
+            print("[Trellis2] NAF_SHARPEN skipped:", _e)
+            return base
+
+import os
+
+# Detect AMD GPU (ROCm)
+is_amd_gpu = torch.cuda.is_available() and 'AMD' in torch.cuda.get_device_name(0)
+print(f'[Trellis2] GPU Type: {"AMD ROCm" if is_amd_gpu else "NVIDIA CUDA"}')
+
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import transforms
@@ -133,6 +186,126 @@ def sample_features(fmap: torch.Tensor, queries_ndc: torch.Tensor) -> torch.Tens
     )  # (B, C, K, 1)
 
     return feat.squeeze(-1)  # (B, C, K)
+
+
+
+# =============================================================================
+# NAF on ROCm: MIOpen off, and exact row bands instead of image tiles
+# =============================================================================
+#
+# Two measured problems with the real NAF on this gfx1030 box (2026-09-23,
+# standalone repro under /mnt/sata/ComfyUI/_debug_naf):
+#
+# 1. MIOpen convolutions race. With cudnn(MIOpen) enabled, 4 of 4 runs showed a
+#    conv output that read non-finite and then finite on the next read of the
+#    SAME tensor; with MIOpen disabled, 0 of 4. A later kernel reads the result
+#    before it is written - NaN when the stale memory is NaN, silently wrong
+#    features when it is not. So every NAF call runs with MIOpen off.
+#
+# 2. The old image tiling was not an approximation of NAF, it was a different
+#    function. Each tile got the image TILE but the WHOLE view's LR features,
+#    which NAF resizes to fill the tile - so tile (1,0) received the top-left of
+#    the whole view's features. GroupNorm statistics and RoPE coordinates were
+#    per-tile too. NAF's only non-local op is a dilated 9x9 neighbourhood
+#    attention (dilation = out/lr = 16 at 1024, so +-64 output rows). Running
+#    the encoder once globally and only the attention in row bands with that
+#    halo is EXACT: max|diff| = 0 against the untiled call at 512.
+
+class _no_miopen:
+    """Disable cudnn (MIOpen on ROCm) for the duration, restore afterwards."""
+    def __enter__(self):
+        self._prev = torch.backends.cudnn.enabled
+        torch.backends.cudnn.enabled = False
+    def __exit__(self, *exc):
+        torch.backends.cudnn.enabled = self._prev
+        return False
+
+
+def _naf_disable_miopen(model):
+    """Route every call of this NAF instance - from any call site - around MIOpen."""
+    if getattr(torch.version, "hip", None) is None or getattr(model, "_trellis2_no_miopen", False):
+        return model
+    orig = model.forward
+    def forward(*args, **kwargs):
+        with _no_miopen():
+            return orig(*args, **kwargs)
+    model.forward = forward
+    model._trellis2_no_miopen = True
+    return model
+
+
+def _real_naf_core(model):
+    """The underlying valeoai NAF module, or None for the bilinear stand-in."""
+    for m in (model, getattr(model, "naf", None)):
+        if m is not None and all(hasattr(m, a) for a in ("image_encoder", "key_encoder", "upsampler")):
+            return m
+    return None
+
+
+def _nearest_exact_index(n_out, n_in, device):
+    # F.interpolate(mode="nearest-exact"): src = floor((dst + 0.5) * in / out), clamped.
+    idx = (torch.arange(n_out, device=device, dtype=torch.float64) + 0.5) * (n_in / n_out)
+    return idx.floor().long().clamp_(max=n_in - 1)
+
+
+def _naf_encode(naf, image, out_size):
+    """NAF's image encoder over the WHOLE image (global GroupNorm stats, global RoPE).
+
+    Without MIOpen the 1024 encoder needs ~7 GiB of im2col scratch on the GPU,
+    so it runs there only when that much is actually free; otherwise on CPU
+    (~16 s per 1024 view, same result to 4e-5).
+    """
+    choice = os.environ.get("TRELLIS2_NAF_ENCODER_DEVICE", "auto").lower()
+    dev = image.device
+    if dev.type == "cuda" and choice == "auto":
+        free, _ = torch.cuda.mem_get_info(dev)
+        choice = "cuda" if free >= 8 * 2**30 else "cpu"
+    if dev.type != "cuda" or choice != "cpu":
+        with _no_miopen():
+            return naf.image_encoder(image, output_size=out_size)
+    import copy
+    enc = copy.deepcopy(naf.image_encoder).cpu()
+    enc.rope._cached_coords = None
+    enc.rope._cached_hw = None
+    print(f"[Trellis2 NAF bands] encoder on CPU ({torch.cuda.mem_get_info(dev)[0] / 2**30:.1f} GiB free on GPU)")
+    return enc(image.cpu(), output_size=out_size).to(dev)
+
+
+@torch.no_grad()
+def _naf_exact_bands(naf, image, lr, out_size, n_bands, keep_margin=2):
+    """Yield (keep_lo, keep_hi, core_lo, core_hi, rows) where
+    rows == NAF(image, lr, out_size)[:, :, keep_lo:keep_hi] exactly.
+
+    keep_margin rows either side of the core let bilinear sampling of any point
+    in the core read both of its neighbouring rows from this band.
+    """
+    from einops import rearrange
+    # Take it from the class's own module globals: the hub package ("src.*") is
+    # only importable while the loader's hide_src_module() context is active.
+    legacy_attention = type(naf.upsampler).forward.__globals__["legacy_attention"]
+    H, W = int(out_size[0]), int(out_size[1])
+    x = _naf_encode(naf, image, (H, W))
+    keys_lr = naf.key_encoder(x, lr)
+    up = naf.upsampler
+    hk, wk = keys_lr.shape[-2:]
+    dil = (H // hk, W // wk)
+    halo = (up.kernel_size[0] // 2) * dil[0]
+    rows_all = _nearest_exact_index(H, hk, lr.device)
+    cols = _nearest_exact_index(W, wk, lr.device)
+    n_bands = max(1, min(int(n_bands), H))
+    for b in range(n_bands):
+        c0, c1 = H * b // n_bands, H * (b + 1) // n_bands
+        k0, k1 = max(0, c0 - keep_margin), min(H, c1 + keep_margin)
+        a0, a1 = max(0, k0 - halo), min(H, k1 + halo)
+        rows = rows_all[a0:a1]
+        q = rearrange(x[:, :, a0:a1], "b (n d) h w -> b h w n d", n=up.num_heads)
+        k = rearrange(keys_lr[:, :, rows][:, :, :, cols], "b (n d) h w -> b h w n d", n=up.num_heads)
+        v = rearrange(lr[:, :, rows][:, :, :, cols], "b (n d) h w -> b h w n d", n=up.num_heads)
+        out = legacy_attention(q, k, v, up.kernel_size, dil, scale=up.scale)
+        del q, k, v
+        out = rearrange(out, "b h w n d -> b (n d) h w")[:, :, k0 - a0:k1 - a0]
+        yield k0, k1, c0, c1, out
+        del out
 
 
 # =============================================================================
@@ -403,7 +576,7 @@ class DinoV3ProjFeatureExtractor(nn.Module):
         )
         
         # NAF upsampler (frozen, no trainable params)
-        self.naf_model = None  # Lazy-loaded on first use to avoid import if not needed
+        self.naf_model = None  # lazy; _load_naf decides
 
         # Per-axis spatial tile factor for the NAF + proj_grid streaming path. 1 = un-tiled
         # (current behavior, default). >1 enables a streaming wrapper that tiles NAF and
@@ -417,6 +590,26 @@ class DinoV3ProjFeatureExtractor(nn.Module):
         self.proj_channels = self.embed_dim * 2 if use_naf_upsample else self.embed_dim
         
         # NOTE: proj_linear removed — now lives in each denoiser block's ProjectAttention
+
+        # ROCm 1024 DINO isolation state.  gfx1030 can occasionally leave
+        # persistent model storage corrupted after a long 4101-token pass.
+        # Keep a pristine CPU state_dict so every multiview extraction starts
+        # from known-good weights instead of reusing potentially damaged VRAM.
+        self._rocm_dino_cpu_master = None
+        self._rocm_dino_restore_count = 0
+
+        # Capture the master while DINO is still freshly loaded on CPU.
+        # Waiting until the second view is too late if a prior ROCm kernel has
+        # already scribbled over persistent GPU storage.
+        if (
+            is_amd_gpu
+            and int(self.image_size) >= 1024
+            and os.environ.get(
+                "TRELLIS2_DINO_RESTORE_MODEL",
+                "1",
+            ) == "1"
+        ):
+            self._ensure_rocm_dino_cpu_master()
     
     def _cached_naf_repo(self) -> Optional[str]:
         import torch.hub
@@ -430,26 +623,123 @@ class DinoV3ProjFeatureExtractor(nn.Module):
                 return repo_dir
         return None    
     
-    def _load_naf(self):
-        """Lazy-load pretrained NAF model."""
+    def _load_naf(self, device=None):
+        # DINO 1024 may intentionally stay on CPU for ROCm correctness while
+        # NAF still consumes GPU-resident image/features.  Therefore NAF's
+        # execution device must come from its actual input, not from
+        # next(self.model.parameters()).device.
+        if self.naf_model is not None:
+            if device is not None:
+                self.naf_model.to(device)
+            return
+        _real = is_amd_gpu and os.environ.get("TRELLIS2_REAL_NAF", "0") == "1"
+        if is_amd_gpu and not _real:
+            self.naf_model = DummyNAFModel()
+            print("[Trellis2] AMD -> DummyNAFModel (bilinear fallback). Set TRELLIS2_REAL_NAF=1 for real NAF.")
+            return
+        if _real:
+            try:
+                import sys as _sys
+                _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+                import _natten_shim as _nshim
+                _nshim.install()
+                print("[Trellis2] real-NAF: pure-torch natten shim installed; loading NAF via torch.hub...")
+            except Exception as _e:
+                print("[Trellis2] shim install failed -> DummyNAFModel:", repr(_e))
+                self.naf_model = DummyNAFModel()
+                return
         if self.naf_model is None:
-            import torch.hub
-            device = next(self.model.parameters()).device            
-            cached_repo = self._cached_naf_repo()
-            
-            if cached_repo is not None:
-                self.naf_model = torch.hub.load(
-                    cached_repo, "naf", pretrained=True, device=device, source="local", trust_repo=True
+            try:
+                self.naf_model = torch.hub.load("valeoai/NAF", "naf", pretrained=True, trust_repo=True)
+            except Exception as _he:
+                print("[Trellis2] hub.load(github) failed:", repr(_he))
+                try:
+                    _ld = os.path.expanduser("~/.cache/torch/hub/valeoai_NAF_main")
+                    if os.path.isdir(_ld):
+                        self.naf_model = torch.hub.load(_ld, "naf", source="local", pretrained=True)
+                except Exception as _he2:
+                    print("[Trellis2] hub.load(local) failed:", repr(_he2))
+            if self.naf_model is not None:
+                self.naf_model.eval()
+                self.naf_model.requires_grad_(False)
+        if self.naf_model is None:
+            print("[Trellis2] NAF load failed -> DummyNAFModel fallback")
+            self.naf_model = DummyNAFModel()
+        else:
+            try:
+                _naf_dtype = os.environ.get(
+                    "TRELLIS2_NAF_DTYPE",
+                    "fp32" if is_amd_gpu else "bf16",
+                ).lower()
+                _naf_device = (
+                    torch.device(device)
+                    if device is not None
+                    else next(self.model.parameters()).device
                 )
-            else:
-                self.naf_model = torch.hub.load(
-                    "valeoai/NAF", "naf", pretrained=True, device=device, trust_repo=True
-                )            
 
-            self.naf_model.eval()
-            self.naf_model.requires_grad_(False)
-        
+                if _naf_dtype in ("fp32", "float32"):
+                    # gfx1030: keep real NAF in native FP32.
+                    # Do not route it through the custom BF16 wrapper.
+                    self.naf_model = self.naf_model.float()
+                    self.naf_model.to(_naf_device)
+                    print(
+                        "[Trellis2] real-NAF dtype=fp32 "
+                        "(BF16 wrapper disabled)"
+                    )
+
+                elif _naf_dtype in ("bf16", "bfloat16"):
+                    self.naf_model = _NAFBf16Wrapper(self.naf_model)
+                    self.naf_model.to(_naf_device)
+                    print("[Trellis2] real-NAF dtype=bf16")
+
+                else:
+                    raise ValueError(
+                        "TRELLIS2_NAF_DTYPE must be fp32 or bf16, got "
+                        + repr(_naf_dtype)
+                    )
+            except Exception as _e:
+                print("[Trellis2] naf device-move skipped:", repr(_e))
+            print("[Trellis2] NAF ready: type=%s" % type(self.naf_model).__name__)
+            _naf_disable_miopen(self.naf_model)
+
+
+    def _cpu1024_pin_dino_on_cpu(self, device) -> bool:
+        """Return True when the 1024 ROCm conditioner must keep DINO on CPU.
+
+        The Pixal3D pipeline calls ``image_cond_model.to(cuda)`` before each
+        conditioning stage.  A normal ``nn.Module.to`` recursively moves every
+        child module, which would move the 1.1 GiB DINO backbone to ROCm only
+        for ``extract_features`` to copy it straight back to CPU.  Besides the
+        wasted transfer/VRAM, that reintroduces the exact GPU residency this
+        correctness mode is meant to avoid.
+        """
+        if not is_amd_gpu or int(self.image_size) < 1024:
+            return False
+        if os.environ.get("TRELLIS2_DINO_1024_CPU", "1") != "1":
+            return False
+        try:
+            return torch.device(device).type in ("cuda", "hip")
+        except Exception:
+            return False
+
     def to(self, device):
+        if self._cpu1024_pin_dino_on_cpu(device):
+            # Do NOT call super().to(device) here: nn.Module.to recursively
+            # descends into self.model and would move DINO to ROCm first.
+            # This wrapper has no trainable tensors of its own; the relevant
+            # children are DINO, projection grid, and optional NAF.
+            self.model.float().cpu()
+            self.proj_grid.to(device)
+            if self.naf_model is not None:
+                self.naf_model.to(device)
+            if not getattr(self, "_trellis2_cpu1024_selective_to_logged", False):
+                print(
+                    "[Pixal3D DINO CPU1024] selective .to(): keeping DINO on CPU; "
+                    f"projection/NAF -> {torch.device(device)}"
+                )
+                self._trellis2_cpu1024_selective_to_logged = True
+            return self
+
         super().to(device)
         self.model.to(device)
         self.proj_grid.to(device)
@@ -458,12 +748,10 @@ class DinoV3ProjFeatureExtractor(nn.Module):
         return self
 
     def cuda(self):
-        super().cuda()
-        self.model.cuda()
-        self.proj_grid.cuda()
-        if self.naf_model is not None:
-            self.naf_model.cuda()
-        return self
+        # Route through the selective ``to`` implementation so a 1024 ROCm
+        # conditioner cannot accidentally be pushed onto the GPU by callers
+        # that use .cuda() instead of .to("cuda").
+        return self.to(torch.device("cuda"))
 
     def cpu(self):
         super().cpu()
@@ -472,20 +760,1525 @@ class DinoV3ProjFeatureExtractor(nn.Module):
         if self.naf_model is not None:
             self.naf_model.cpu()
         return self
-    
-    def extract_features(self, image: torch.Tensor) -> torch.Tensor:
-        """Extract features using DINOv3."""
-        image = image.to(self.model.embeddings.patch_embeddings.weight.dtype)
-        hidden_states = self.model.embeddings(image, bool_masked_pos=None)
-        position_embeddings = self.model.rope_embeddings(image)
 
-        for layer_module in self.model.layer:
-            hidden_states = layer_module(
-                hidden_states,
-                position_embeddings=position_embeddings,
+    def _ensure_rocm_dino_cpu_master(self):
+        """Snapshot a pristine CPU copy of the complete DINO state once.
+
+        The previous workaround only protected LayerNorm affine parameters.
+        That cannot recover if a long ROCm kernel damages patch embedding,
+        attention, MLP, layer-scale, or another persistent tensor between
+        multiview chunks.  A full state snapshot gives each view a clean start.
+        """
+        if self._rocm_dino_cpu_master is not None:
+            return
+
+        master = {}
+        total_bytes = 0
+
+        with torch.no_grad():
+            for name, tensor in self.model.state_dict().items():
+                src = tensor.detach().to(device="cpu").clone()
+
+                # DINO is forced to FP32 on the ROCm safe path.  Keep floating
+                # masters in FP32 as well so a later restore cannot reintroduce
+                # reduced-precision state.
+                if src.is_floating_point() and src.dtype != torch.float32:
+                    src = src.float()
+
+                if src.is_floating_point() and not bool(torch.isfinite(src).all().item()):
+                    raise RuntimeError(
+                        "[Pixal3D DINO STATE] refusing to snapshot non-finite "
+                        f"parameter/buffer {name!r}"
+                    )
+
+                master[name] = src
+                total_bytes += src.numel() * src.element_size()
+
+        self._rocm_dino_cpu_master = master
+
+        print(
+            "[Pixal3D DINO STATE] pristine full-model CPU master cached: "
+            f"{len(master)} tensors, {total_bytes / (1024 ** 2):.1f} MiB"
+        )
+
+    def _restore_rocm_dino_cpu_master(self):
+        """Restore the full DINO state in-place from the CPU master."""
+        self._ensure_rocm_dino_cpu_master()
+        current = self.model.state_dict()
+
+        with torch.no_grad():
+            for name, src in self._rocm_dino_cpu_master.items():
+                dst = current.get(name)
+                if dst is None:
+                    raise RuntimeError(
+                        "[Pixal3D DINO STATE] state key disappeared: "
+                        + name
+                    )
+                dst.copy_(src, non_blocking=False)
+
+        self.model.eval()
+        self._rocm_dino_restore_count += 1
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        print(
+            "[Pixal3D DINO STATE] full model restored from CPU master "
+            f"(view pass {self._rocm_dino_restore_count})"
+        )
+    
+    def _extract_features_rocm_cpu_1024(
+        self,
+        image: torch.Tensor,
+        output_device: torch.device,
+        debug: bool = True,
+    ) -> torch.Tensor:
+        """Run the unstable 1024 DINO pass entirely on CPU.
+
+        gfx1030/ROCm has now demonstrated corruption at *multiple* GEMM sites:
+        Q/K/V projection, attention score/value products, and the final
+        attention output can all become NaN/Inf or silently enormous while
+        their inputs are finite.  Once Q/K/V themselves are wrong, retrying
+        only the attention matmul on CPU cannot recover the layer because the
+        CPU receives already-corrupted projected tensors.
+
+        The correctness path therefore keeps the 1024 DINO transformer on
+        CPU from embeddings through final LayerNorm.  Only the completed,
+        validated feature tensor is copied back to the caller's device.
+        512-stage DINO and the rest of TRELLIS/Pixal3D remain on the GPU.
+        """
+        import contextlib
+
+        print(
+            "[Pixal3D DINO CPU1024] gfx1030 correctness mode: "
+            "running the complete 1024 DINO transformer on CPU"
+        )
+
+        # Move the potentially-corrupted GPU copy out of the way first, then
+        # overwrite every parameter/buffer from the pristine CPU master.  The
+        # master was captured immediately after model load, before any long
+        # ROCm kernel ran.
+        self.model = self.model.float().cpu()
+        self._restore_rocm_dino_cpu_master()
+        self.model.eval()
+
+        # Hard verification: no DINO parameter may remain on ROCm in this
+        # path.  Failing loudly here is better than silently re-entering the
+        # exact GPU kernels that corrupted the previous runs.
+        _non_cpu = {str(p.device) for p in self.model.parameters() if p.device.type != "cpu"}
+        if _non_cpu:
+            raise RuntimeError(
+                "[Pixal3D DINO CPU1024] model is not fully on CPU: "
+                + ", ".join(sorted(_non_cpu))
             )
 
-        return F.layer_norm(hidden_states, hidden_states.shape[-1:])
+        image_cpu = image.detach().to(
+            device="cpu",
+            dtype=torch.float32,
+        ).contiguous()
+
+        def _cpu_validate(name: str, tensor: torch.Tensor) -> None:
+            if not tensor.is_floating_point():
+                return
+            finite = torch.isfinite(tensor)
+            bad = tensor.numel() - int(finite.sum().item())
+            absmax = (
+                float(tensor.detach().abs().amax().item())
+                if tensor.numel()
+                else 0.0
+            )
+            if debug:
+                print(
+                    "[Pixal3D DINO CPU1024] "
+                    f"{name}: shape={tuple(tensor.shape)}, "
+                    f"dtype={tensor.dtype}, bad={bad}, "
+                    f"absmax={absmax:.6g}"
+                )
+            if bad:
+                raise RuntimeError(
+                    "[Pixal3D DINO CPU1024] "
+                    f"{name} produced {bad} NaN/Inf values on CPU"
+                )
+
+            # IMPORTANT: do not reject large-but-finite intermediate DINO
+            # residuals.  The original Pixal3D extractor intentionally lets
+            # those residual streams grow very large and applies an explicit
+            # F.layer_norm() only after the final transformer block.  The
+            # user's CPU run reproduced the exact same ~1.39588e5 layer-0
+            # magnitude with both SDPA and eager attention, proving that the
+            # old 1e4 cutoff was a false-positive rather than ROCm corruption.
+            # NaN/Inf remains fatal; magnitude sanity is applied only to the
+            # *final normalized* features below.
+
+        requested_impl = os.environ.get(
+            "TRELLIS2_DINO_1024_CPU_ATTN",
+            "sdpa",
+        ).strip().lower()
+        if requested_impl not in ("sdpa", "eager"):
+            requested_impl = "sdpa"
+
+        previous_impl = getattr(
+            self.model.config,
+            "_attn_implementation",
+            None,
+        )
+
+        def _run_once(attn_impl: str) -> torch.Tensor:
+            self.model.config._attn_implementation = attn_impl
+            print(
+                "[Pixal3D DINO CPU1024] attention backend="
+                + repr(attn_impl)
+            )
+
+            with torch.inference_mode(), contextlib.nullcontext():
+                hidden_states = self.model.embeddings(
+                    image_cpu,
+                    bool_masked_pos=None,
+                )
+                _cpu_validate("embeddings", hidden_states)
+
+                position_embeddings = self.model.rope_embeddings(
+                    image_cpu
+                )
+                _cpu_validate("rope_cos", position_embeddings[0])
+                _cpu_validate("rope_sin", position_embeddings[1])
+
+                for layer_idx, layer_module in enumerate(self.model.layer):
+                    hidden_states = layer_module(
+                        hidden_states,
+                        position_embeddings=position_embeddings,
+                    )
+                    _cpu_validate(
+                        f"layer_{layer_idx}",
+                        hidden_states,
+                    )
+
+                # Pixal3D's released projected-image conditioner does NOT use
+                # DINO's learned affine final norm.  The official extractor
+                # returns F.layer_norm(hidden_states, hidden_states.shape[-1:])
+                # and the released *_mv denoisers were trained against exactly
+                # that feature distribution.  Keep the generic Trellis2 path
+                # unchanged, but make the Pixal3D MV subclass use the official
+                # parameterless normalization on this CPU1024 correctness path.
+                if getattr(self, "_pixal3d_official_final_norm", False):
+                    hidden_states = F.layer_norm(
+                        hidden_states,
+                        hidden_states.shape[-1:],
+                    )
+                elif hasattr(self.model, "norm"):
+                    hidden_states = self.model.norm(hidden_states)
+                else:
+                    hidden_states = F.layer_norm(
+                        hidden_states,
+                        hidden_states.shape[-1:],
+                    )
+                _cpu_validate(
+                    "final_layer_norm",
+                    hidden_states,
+                )
+
+                # Do not add another arbitrary magnitude cutoff here.  The
+                # production extractor validates finiteness, not an ad-hoc
+                # absmax threshold.  Shape is checked immediately below.
+
+                _num_reg = int(getattr(self.model.config, "num_register_tokens", 4))
+                _expected_tokens = 1 + _num_reg + self.patch_number * self.patch_number
+                if (
+                    hidden_states.ndim != 3
+                    or hidden_states.shape[1] != _expected_tokens
+                    or hidden_states.shape[2] != self.embed_dim
+                ):
+                    raise RuntimeError(
+                        "[Pixal3D DINO CPU1024] unexpected final feature shape "
+                        f"{tuple(hidden_states.shape)}; expected "
+                        f"[B,{_expected_tokens},{self.embed_dim}]"
+                    )
+
+                return hidden_states.contiguous()
+
+        try:
+            try:
+                hidden_cpu = _run_once(requested_impl)
+            except Exception as first_error:
+                if requested_impl == "eager":
+                    raise
+                print(
+                    "[Pixal3D DINO CPU1024] CPU SDPA pass failed; "
+                    "restoring pristine state and retrying with eager: "
+                    + repr(first_error)
+                )
+                self._restore_rocm_dino_cpu_master()
+                hidden_cpu = _run_once("eager")
+        finally:
+            # Keep the 1024 model on CPU by default.  Moving 1.1 GiB of DINO
+            # weights back to gfx1030 after every view both wastes time and
+            # reintroduces the storage we are deliberately isolating from.
+            # This extractor instance is the 1024 conditioner; the separate
+            # 512 conditioner remains GPU resident.
+            if os.environ.get(
+                "TRELLIS2_DINO_1024_CPU_KEEP_MODEL",
+                "1",
+            ) != "1":
+                self.model.to(output_device)
+
+            if previous_impl is not None:
+                self.model.config._attn_implementation = previous_impl
+
+        result = hidden_cpu.to(
+            device=output_device,
+            dtype=torch.float32,
+            non_blocking=False,
+        )
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        print(
+            "[Pixal3D DINO CPU1024] completed; validated features copied "
+            f"back to {output_device}"
+        )
+        return result
+
+    def extract_features(self, image: torch.Tensor) -> torch.Tensor:
+        """Extract features using DINOv3."""
+
+        is_rocm = (
+            getattr(torch.version, "hip", None)
+            is not None
+        )
+
+        debug_1024 = (
+            is_rocm
+            and image.shape[-2] >= 1024
+            and image.shape[-1] >= 1024
+            and os.environ.get(
+                "TRELLIS2_DINO_LAYER_DEBUG",
+                "1",
+            ) == "1"
+        )
+
+        if is_rocm:
+            # [Pixal3D DINO ROCm FP32/eager]
+            #
+            # DINOv3 attention dispatches through
+            # model.config._attn_implementation.
+            #
+            # gfx1030 becomes non-finite on the 64x64-patch
+            # (1024 image) path when the optimized attention
+            # backend is used. Keep DINO itself in FP32 and
+            # use the explicit eager attention implementation.
+            self.model = self.model.float()
+
+            if (
+                getattr(
+                    self.model.config,
+                    "_attn_implementation",
+                    None,
+                )
+                != "eager"
+            ):
+                old_impl = getattr(
+                    self.model.config,
+                    "_attn_implementation",
+                    None,
+                )
+
+                self.model.config._attn_implementation = (
+                    "eager"
+                )
+
+                print(
+                    "[Pixal3D DINO ROCm FP32/eager] "
+                    f"attention {old_impl!r} -> 'eager'"
+                )
+
+            image = image.float()
+
+        else:
+            image = image.to(
+                self.model
+                .embeddings
+                .patch_embeddings
+                .weight
+                .dtype
+            )
+
+        # v4 correctness path: the latest real run proves that the fault is
+        # earlier than the attention score GEMM.  CPU-recomputing QK^T from
+        # already-corrupted GPU Q/K cannot fix the layer.  For the 1024 ROCm
+        # conditioner, default to a complete CPU DINO forward and copy only
+        # the validated final features back to the GPU.
+        force_cpu_1024 = (
+            is_rocm
+            and image.shape[-2] >= 1024
+            and image.shape[-1] >= 1024
+            and os.environ.get(
+                "TRELLIS2_DINO_1024_CPU",
+                "1",
+            ) == "1"
+        )
+
+        if force_cpu_1024:
+            return self._extract_features_rocm_cpu_1024(
+                image,
+                output_device=image.device,
+                debug=(
+                    os.environ.get(
+                        "TRELLIS2_DINO_LAYER_DEBUG",
+                        "1",
+                    ) == "1"
+                ),
+            )
+
+        self.model.to(image.device)
+
+        # Full model-state isolation for the unstable 1024 ROCm multiview
+        # path.  This is intentionally enabled by default on ROCm and can be
+        # disabled only for A/B testing with TRELLIS2_DINO_RESTORE_MODEL=0.
+        restore_full_model = (
+            is_rocm
+            and image.shape[-2] >= 1024
+            and image.shape[-1] >= 1024
+            and os.environ.get(
+                "TRELLIS2_DINO_RESTORE_MODEL",
+                "1",
+            ) == "1"
+        )
+
+        if restore_full_model:
+            self._restore_rocm_dino_cpu_master()
+
+        def check_finite(name, tensor):
+            if not debug_1024:
+                return
+
+            mask_cpu = (
+                torch.isfinite(tensor)
+                .detach()
+                .cpu()
+            )
+
+            finite_count = int(
+                mask_cpu.sum().item()
+            )
+
+            bad = (
+                tensor.numel()
+                - finite_count
+            )
+
+            # Finite-only checks missed the actual signature seen on the
+            # second view: values can remain finite yet be so large that the
+            # naive variance calculation overflows.  Always log absmax too.
+            absmax = float(
+                tensor.detach().float().abs().amax().cpu().item()
+            ) if tensor.numel() else 0.0
+
+            print(
+                "[Pixal3D DINO 1024] "
+                f"{name}: "
+                f"shape={tuple(tensor.shape)}, "
+                f"dtype={tensor.dtype}, "
+                f"finite={finite_count}/"
+                f"{tensor.numel()}, "
+                f"bad={bad}, absmax={absmax:.6g}"
+            )
+
+            if bad:
+                raise RuntimeError(
+                    "[Pixal3D DINO 1024] "
+                    f"{name} produced {bad} "
+                    "real NaN/Inf values"
+                )
+
+        ctx = (
+            torch.autocast(
+                device_type="cuda",
+                enabled=False,
+            )
+            if is_rocm
+            else __import__("contextlib").nullcontext()
+        )
+
+        with ctx:
+            hidden_states = self.model.embeddings(
+                image,
+                bool_masked_pos=None,
+            )
+
+            check_finite(
+                "embeddings",
+                hidden_states,
+            )
+
+            position_embeddings = (
+                self.model.rope_embeddings(image)
+            )
+
+            check_finite(
+                "rope_cos",
+                position_embeddings[0],
+            )
+
+            check_finite(
+                "rope_sin",
+                position_embeddings[1],
+            )
+
+            # ----------------------------------------------------
+            # gfx1030/ROCm recovery path for long DINO sequences.
+            #
+            # Run the normal FP32/eager layer first. If a 1024-stage
+            # layer produces NaN/Inf, rerun ONLY that layer using
+            # query-chunked FP32 attention and token-chunked MLP.
+            #
+            # This avoids a single enormous [N,N] eager attention
+            # operation without slowing down every healthy layer.
+            # ----------------------------------------------------
+
+            def _cpu_bad_count(t):
+                finite_cpu = (
+                    torch.isfinite(t)
+                    .detach()
+                    .cpu()
+                )
+                return (
+                    t.numel()
+                    - int(finite_cpu.sum().item())
+                )
+
+            def _require_safe(name, t):
+                bad = _cpu_bad_count(t)
+                if bad:
+                    raise RuntimeError(
+                        "[Pixal3D DINO SAFE FALLBACK] "
+                        f"{name} produced {bad} "
+                        "NaN/Inf values"
+                    )
+                return t
+
+            # [Pixal3D DINO SAFE NORM]
+            #
+            # gfx1030 / ROCm:
+            # avoid the native large LayerNorm kernel for the
+            # 4101 x 1024 DINO sequence.
+            #
+            # Also keep pristine CPU master copies of LayerNorm
+            # affine parameters. This protects the safe path from
+            # accidental GPU-side parameter corruption across views.
+            def _ensure_norm_master(norm):
+                if getattr(
+                    norm,
+                    "_trellis2_rocm_norm_master_ready",
+                    False,
+                ):
+                    return
+
+                weight = getattr(
+                    norm,
+                    "weight",
+                    None,
+                )
+
+                bias = getattr(
+                    norm,
+                    "bias",
+                    None,
+                )
+
+                weight_cpu = (
+                    weight
+                    .detach()
+                    .cpu()
+                    .float()
+                    .clone()
+                    if weight is not None
+                    else None
+                )
+
+                bias_cpu = (
+                    bias
+                    .detach()
+                    .cpu()
+                    .float()
+                    .clone()
+                    if bias is not None
+                    else None
+                )
+
+                object.__setattr__(
+                    norm,
+                    "_trellis2_rocm_norm_weight_cpu",
+                    weight_cpu,
+                )
+
+                object.__setattr__(
+                    norm,
+                    "_trellis2_rocm_norm_bias_cpu",
+                    bias_cpu,
+                )
+
+                object.__setattr__(
+                    norm,
+                    "_trellis2_rocm_norm_master_ready",
+                    True,
+                )
+
+            def _safe_layer_norm_token_chunks(
+                norm,
+                x,
+                token_chunk,
+                name,
+            ):
+                _ensure_norm_master(norm)
+
+                token_chunk = max(
+                    1,
+                    int(token_chunk),
+                )
+
+                eps = float(
+                    getattr(
+                        norm,
+                        "eps",
+                        1e-5,
+                    )
+                )
+
+                weight_cpu = getattr(
+                    norm,
+                    "_trellis2_rocm_norm_weight_cpu",
+                    None,
+                )
+
+                bias_cpu = getattr(
+                    norm,
+                    "_trellis2_rocm_norm_bias_cpu",
+                    None,
+                )
+
+                weight = (
+                    weight_cpu.to(
+                        device=x.device,
+                        dtype=torch.float32,
+                    )
+                    if weight_cpu is not None
+                    else None
+                )
+
+                bias = (
+                    bias_cpu.to(
+                        device=x.device,
+                        dtype=torch.float32,
+                    )
+                    if bias_cpu is not None
+                    else None
+                )
+
+                out_parts = []
+
+                for start in range(
+                    0,
+                    x.shape[1],
+                    token_chunk,
+                ):
+                    end = min(
+                        start + token_chunk,
+                        x.shape[1],
+                    )
+
+                    src = (
+                        x[:, start:end]
+                        .contiguous()
+                        .float()
+                    )
+
+                    _require_safe(
+                        f"{name}.input."
+                        f"{start}:{end}",
+                        src,
+                    )
+
+                    # Explicit *scaled* FP32 LayerNorm.
+                    #
+                    # Do NOT call nn.LayerNorm/F.layer_norm here.  Also do not
+                    # use mean((x-mean)^2) directly: a tensor may contain only
+                    # finite values while square() still overflows FP32.
+                    # Normalising each token by its max magnitude first keeps
+                    # all intermediate variance math bounded.
+                    scale = src.abs().amax(
+                        dim=-1,
+                        keepdim=True,
+                    )
+
+                    _require_safe(
+                        f"{name}.scale.{start}:{end}",
+                        scale,
+                    )
+
+                    safe_scale = scale.clamp_min(1.0)
+                    src_scaled = src / safe_scale
+
+                    mean_scaled = src_scaled.mean(
+                        dim=-1,
+                        keepdim=True,
+                    )
+
+                    centered_scaled = (
+                        src_scaled - mean_scaled
+                    )
+
+                    var_scaled = (
+                        centered_scaled
+                        .square()
+                        .mean(
+                            dim=-1,
+                            keepdim=True,
+                        )
+                    )
+
+                    # eps / scale^2, written via reciprocal to avoid an
+                    # overflow in scale.square() when scale itself is huge.
+                    inv_scale = safe_scale.reciprocal()
+                    eps_scaled = (
+                        eps * inv_scale.square()
+                    )
+
+                    inv_std_scaled = torch.rsqrt(
+                        var_scaled.clamp_min(0.0)
+                        + eps_scaled
+                    )
+
+                    part = (
+                        centered_scaled
+                        * inv_std_scaled
+                    )
+
+                    if weight is not None:
+                        part = (
+                            part
+                            * weight.view(
+                                1,
+                                1,
+                                -1,
+                            )
+                        )
+
+                    if bias is not None:
+                        part = (
+                            part
+                            + bias.view(
+                                1,
+                                1,
+                                -1,
+                            )
+                        )
+
+                    _require_safe(
+                        f"{name}.output."
+                        f"{start}:{end}",
+                        part,
+                    )
+
+                    out_parts.append(part)
+
+                out = torch.cat(
+                    out_parts,
+                    dim=1,
+                )
+
+                _require_safe(
+                    name,
+                    out,
+                )
+
+                return out
+
+            def _linear_token_chunks(
+                linear,
+                x,
+                token_chunk,
+            ):
+                parts = []
+
+                for start in range(
+                    0,
+                    x.shape[1],
+                    token_chunk,
+                ):
+                    end = min(
+                        start + token_chunk,
+                        x.shape[1],
+                    )
+
+                    part = linear(
+                        x[:, start:end]
+                    )
+
+                    _require_safe(
+                        "linear chunk "
+                        f"{start}:{end}",
+                        part,
+                    )
+
+                    parts.append(part)
+
+                return torch.cat(
+                    parts,
+                    dim=1,
+                )
+
+            def _rotate_half_local(x):
+                half = x.shape[-1] // 2
+
+                return torch.cat(
+                    (
+                        -x[..., half:],
+                        x[..., :half],
+                    ),
+                    dim=-1,
+                )
+
+            def _apply_rope_local(
+                q,
+                k,
+                pos,
+            ):
+                cos, sin = pos
+
+                num_tokens = q.shape[-2]
+                num_patches = sin.shape[-2]
+                num_prefix = (
+                    num_tokens - num_patches
+                )
+
+                q_prefix = q[..., :num_prefix, :]
+                q_patch = q[..., num_prefix:, :]
+
+                k_prefix = k[..., :num_prefix, :]
+                k_patch = k[..., num_prefix:, :]
+
+                cos = cos.float()
+                sin = sin.float()
+
+                # [patches, head_dim]
+                # ->
+                # [1, 1, patches, head_dim]
+                while cos.ndim < q_patch.ndim:
+                    cos = cos.unsqueeze(0)
+                    sin = sin.unsqueeze(0)
+
+                q_patch = (
+                    q_patch * cos
+                    + _rotate_half_local(q_patch) * sin
+                )
+
+                k_patch = (
+                    k_patch * cos
+                    + _rotate_half_local(k_patch) * sin
+                )
+
+                q = torch.cat(
+                    (q_prefix, q_patch),
+                    dim=-2,
+                )
+
+                k = torch.cat(
+                    (k_prefix, k_patch),
+                    dim=-2,
+                )
+
+                return q, k
+
+            def _rocm_block_matmul(
+                a,
+                b,
+                name,
+                scale=1.0,
+            ):
+                """
+                Small-block GEMM with a correctness fallback for gfx1030.
+
+                The failure in the real four-view run is not an input NaN:
+                finite Q/K produced NaNs *inside* the ROCm score GEMM.  We
+                therefore validate each deliberately small attention block.
+                A failed (or implausibly huge finite) GPU block is recomputed
+                on CPU and copied back.  CPU is a rare recovery path, not the
+                normal attention implementation.
+                """
+                out = torch.matmul(a, b)
+                if scale != 1.0:
+                    out.mul_(float(scale))
+
+                finite_ok = bool(
+                    torch.isfinite(out).all().item()
+                )
+
+                if finite_ok and out.numel():
+                    absmax = float(
+                        out.detach().abs().amax().item()
+                    )
+                else:
+                    absmax = float("inf")
+
+                max_abs = float(
+                    os.environ.get(
+                        "TRELLIS2_DINO_SAFE_GEMM_ABSMAX",
+                        "10000",
+                    )
+                )
+
+                if finite_ok and absmax <= max_abs:
+                    return out
+
+                print(
+                    "[Pixal3D DINO GEMM CPU FALLBACK] "
+                    f"{name}: gpu_finite={finite_ok}, "
+                    f"gpu_absmax={absmax:.6g}; "
+                    "recomputing this block on CPU"
+                )
+
+                out_cpu = torch.matmul(
+                    a.detach().float().cpu(),
+                    b.detach().float().cpu(),
+                )
+                if scale != 1.0:
+                    out_cpu.mul_(float(scale))
+
+                _require_safe(
+                    f"{name}.cpu",
+                    out_cpu,
+                )
+
+                cpu_absmax = (
+                    float(out_cpu.abs().amax().item())
+                    if out_cpu.numel()
+                    else 0.0
+                )
+                if cpu_absmax > max_abs:
+                    print(
+                        "[Pixal3D DINO GEMM CPU FALLBACK] "
+                        f"{name}: CPU result is finite but large "
+                        f"(absmax={cpu_absmax:.6g}); keeping the "
+                        "CPU result because it is numerically valid"
+                    )
+
+                return out_cpu.to(
+                    device=a.device,
+                    dtype=torch.float32,
+                )
+
+            def _safe_chunked_layer(
+                layer_module,
+                layer_input,
+                pos,
+                layer_idx,
+            ):
+                q_chunk = int(
+                    os.environ.get(
+                        "TRELLIS2_DINO_SAFE_QCHUNK",
+                        "256",
+                    )
+                )
+
+                token_chunk = int(
+                    os.environ.get(
+                        "TRELLIS2_DINO_SAFE_TOKEN_CHUNK",
+                        "512",
+                    )
+                )
+
+                # gfx1030/ROCm can return NaN/Inf (or silently enormous
+                # finite garbage) from the 4101-wide attention GEMMs even
+                # when Q/K/V are all finite.  Query chunking alone does not
+                # change that K dimension.  Split the key/value axis too and
+                # use an online-softmax reduction so no GEMM ever spans all
+                # 4101 tokens.
+                k_chunk = int(
+                    os.environ.get(
+                        "TRELLIS2_DINO_SAFE_KCHUNK",
+                        "512",
+                    )
+                )
+
+                norm_chunk = int(
+                    os.environ.get(
+                        "TRELLIS2_DINO_SAFE_NORM_CHUNK",
+                        "64",
+                    )
+                )
+
+                print(
+                    "[Pixal3D DINO SAFE FALLBACK] "
+                    f"layer={layer_idx}, "
+                    f"q_chunk={q_chunk}, "
+                    f"k_chunk={k_chunk}, "
+                    f"token_chunk={token_chunk}, "
+                    f"norm_chunk={norm_chunk}"
+                )
+
+                # ------------------------------
+                # Attention half of DINO block
+                # ------------------------------
+
+                residual = layer_input.float()
+
+                x = _safe_layer_norm_token_chunks(
+                    layer_module.norm1,
+                    residual,
+                    norm_chunk,
+                    f"layer_{layer_idx}.norm1",
+                )
+
+                attn = layer_module.attention
+
+                q = _linear_token_chunks(
+                    attn.q_proj,
+                    x,
+                    token_chunk,
+                )
+
+                k = _linear_token_chunks(
+                    attn.k_proj,
+                    x,
+                    token_chunk,
+                )
+
+                v = _linear_token_chunks(
+                    attn.v_proj,
+                    x,
+                    token_chunk,
+                )
+
+                B, N, C = q.shape
+
+                H = attn.num_heads
+                D = attn.head_dim
+
+                q = (
+                    q.view(B, N, H, D)
+                    .transpose(1, 2)
+                    .contiguous()
+                )
+
+                k = (
+                    k.view(B, N, H, D)
+                    .transpose(1, 2)
+                    .contiguous()
+                )
+
+                v = (
+                    v.view(B, N, H, D)
+                    .transpose(1, 2)
+                    .contiguous()
+                )
+
+                q, k = _apply_rope_local(
+                    q,
+                    k,
+                    pos,
+                )
+
+                _require_safe(
+                    f"layer_{layer_idx}.q_rope",
+                    q,
+                )
+
+                _require_safe(
+                    f"layer_{layer_idx}.k_rope",
+                    k,
+                )
+
+                # Clamp chunks once we know the sequence length.  The K/V
+                # chunk is the critical part of the gfx1030 workaround: both
+                # QK^T and P@V now operate on at most k_chunk keys at a time.
+                q_chunk = max(1, min(int(q_chunk), N))
+                k_chunk = max(1, min(int(k_chunk), N))
+
+                attn_parts = []
+
+                scaling = float(
+                    getattr(
+                        attn,
+                        "scaling",
+                        D ** -0.5,
+                    )
+                )
+
+                for start in range(
+                    0,
+                    N,
+                    q_chunk,
+                ):
+                    end = min(
+                        start + q_chunk,
+                        N,
+                    )
+
+                    q_part = q[:, :, start:end, :]
+                    q_len = int(end - start)
+
+                    # Numerically stable online softmax over key blocks.
+                    # This is mathematically equivalent to
+                    # softmax(QK^T * scale) @ V, but never launches the
+                    # problematic [Q, 4101] ROCm GEMM and never materializes
+                    # the full attention matrix.
+                    running_max = torch.full(
+                        (B, H, q_len, 1),
+                        -float("inf"),
+                        device=q.device,
+                        dtype=torch.float32,
+                    )
+                    running_sum = torch.zeros(
+                        (B, H, q_len, 1),
+                        device=q.device,
+                        dtype=torch.float32,
+                    )
+                    running_out = torch.zeros(
+                        (B, H, q_len, D),
+                        device=q.device,
+                        dtype=torch.float32,
+                    )
+
+                    for k_start in range(0, N, k_chunk):
+                        k_end = min(k_start + k_chunk, N)
+
+                        k_part = k[:, :, k_start:k_end, :]
+                        v_part = v[:, :, k_start:k_end, :]
+
+                        _score_name = (
+                            "layer_"
+                            f"{layer_idx}.scores."
+                            f"q{start}:{end}.k{k_start}:{k_end}"
+                        )
+                        scores = _rocm_block_matmul(
+                            q_part,
+                            k_part.transpose(-2, -1).contiguous(),
+                            _score_name,
+                            scale=scaling,
+                        )
+
+                        _require_safe(
+                            _score_name,
+                            scores,
+                        )
+
+                        block_max = scores.amax(
+                            dim=-1,
+                            keepdim=True,
+                        )
+                        new_max = torch.maximum(
+                            running_max,
+                            block_max,
+                        )
+
+                        # exp(-inf - finite) is exactly zero on the first
+                        # block, which is the desired contribution from the
+                        # empty running accumulator.
+                        old_scale = torch.exp(
+                            running_max - new_max
+                        )
+                        block_exp = torch.exp(
+                            scores - new_max
+                        )
+
+                        _require_safe(
+                            "layer_"
+                            f"{layer_idx}.exp."
+                            f"q{start}:{end}.k{k_start}:{k_end}",
+                            block_exp,
+                        )
+
+                        block_sum = block_exp.sum(
+                            dim=-1,
+                            keepdim=True,
+                        )
+                        _value_name = (
+                            "layer_"
+                            f"{layer_idx}.attn_block."
+                            f"q{start}:{end}.k{k_start}:{k_end}"
+                        )
+                        block_out = _rocm_block_matmul(
+                            block_exp,
+                            v_part,
+                            _value_name,
+                        )
+
+                        _require_safe(
+                            _value_name,
+                            block_out,
+                        )
+
+                        running_out = (
+                            running_out * old_scale
+                            + block_out
+                        )
+                        running_sum = (
+                            running_sum * old_scale
+                            + block_sum
+                        )
+                        running_max = new_max
+
+                        del (
+                            scores,
+                            block_max,
+                            new_max,
+                            old_scale,
+                            block_exp,
+                            block_sum,
+                            block_out,
+                            k_part,
+                            v_part,
+                        )
+
+                    part = running_out / running_sum.clamp_min(
+                        torch.finfo(torch.float32).tiny
+                    )
+
+                    _require_safe(
+                        "layer_"
+                        f"{layer_idx}.attn."
+                        f"{start}:{end}",
+                        part,
+                    )
+
+                    attn_parts.append(part)
+
+                    del running_max, running_sum, running_out, q_part
+
+                x = torch.cat(
+                    attn_parts,
+                    dim=2,
+                )
+
+                del attn_parts
+                del q, k, v
+
+                x = (
+                    x.transpose(1, 2)
+                    .contiguous()
+                    .view(B, N, C)
+                )
+
+                x = _linear_token_chunks(
+                    attn.o_proj,
+                    x,
+                    token_chunk,
+                )
+
+                x = layer_module.layer_scale1(
+                    x
+                )
+
+                x = (
+                    layer_module.drop_path(x)
+                    + residual
+                )
+
+                _require_safe(
+                    f"layer_{layer_idx}.attn_residual",
+                    x,
+                )
+
+                # ------------------------------
+                # MLP half of DINO block
+                # ------------------------------
+
+                residual = x
+
+                x = _safe_layer_norm_token_chunks(
+                    layer_module.norm2,
+                    x,
+                    norm_chunk,
+                    f"layer_{layer_idx}.norm2",
+                )
+
+                mlp_parts = []
+
+                for start in range(
+                    0,
+                    N,
+                    token_chunk,
+                ):
+                    end = min(
+                        start + token_chunk,
+                        N,
+                    )
+
+                    part = layer_module.mlp(
+                        x[:, start:end]
+                    ).float()
+
+                    _require_safe(
+                        "layer_"
+                        f"{layer_idx}.mlp."
+                        f"{start}:{end}",
+                        part,
+                    )
+
+                    mlp_parts.append(part)
+
+                x = torch.cat(
+                    mlp_parts,
+                    dim=1,
+                )
+
+                del mlp_parts
+
+                x = layer_module.layer_scale2(
+                    x
+                )
+
+                x = (
+                    layer_module.drop_path(x)
+                    + residual
+                )
+
+                _require_safe(
+                    f"layer_{layer_idx}.final",
+                    x,
+                )
+
+                return x
+
+            safe_fallback_enabled = (
+                is_rocm
+                and debug_1024
+                and os.environ.get(
+                    "TRELLIS2_DINO_SAFE_FALLBACK",
+                    "1",
+                ) == "1"
+            )
+
+            # [Pixal3D DINO SAFE ALWAYS]
+            #
+            # gfx1030/ROCm: do not execute the full 4101-token
+            # eager-attention kernel first. We have observed that
+            # kernel corrupt different layers/views nondeterministically.
+            #
+            # Run the query-chunked FP32 implementation directly for
+            # every 1024 DINO transformer layer.
+            safe_always = (
+                is_rocm
+                and debug_1024
+                and os.environ.get(
+                    "TRELLIS2_DINO_SAFE_ALWAYS",
+                    "1",
+                ) == "1"
+            )
+
+            if safe_always:
+                print(
+                    "[Pixal3D DINO SAFE ALWAYS] "
+                    "using chunked FP32 attention for all "
+                    "1024 DINO layers"
+                )
+
+                # Snapshot every LayerNorm parameter BEFORE
+                # running any long-sequence GPU kernels.
+                for _layer in self.model.layer:
+                    _ensure_norm_master(
+                        _layer.norm1
+                    )
+                    _ensure_norm_master(
+                        _layer.norm2
+                    )
+
+                if hasattr(
+                    self.model,
+                    "norm",
+                ):
+                    _ensure_norm_master(
+                        self.model.norm
+                    )
+
+                print(
+                    "[Pixal3D DINO SAFE NORM] "
+                    "cached pristine CPU LayerNorm "
+                    "parameters"
+                )
+
+            for layer_idx, layer_module in enumerate(
+                self.model.layer
+            ):
+                if safe_always:
+                    hidden_states = _safe_chunked_layer(
+                        layer_module,
+                        hidden_states,
+                        position_embeddings,
+                        layer_idx,
+                    )
+
+                    check_finite(
+                        f"layer_{layer_idx}",
+                        hidden_states,
+                    )
+
+                    continue
+
+                # Reactive fallback retained for experimentation,
+                # but preserve an independent copy because a failed
+                # GPU kernel must not be allowed to poison recovery.
+                layer_input = (
+                    hidden_states.clone()
+                    if safe_fallback_enabled
+                    else hidden_states
+                )
+
+                hidden_states = layer_module(
+                    hidden_states,
+                    position_embeddings=position_embeddings,
+                )
+
+                layer_bad = (
+                    _cpu_bad_count(hidden_states)
+                    if debug_1024
+                    else 0
+                )
+
+                if (
+                    layer_bad
+                    and safe_fallback_enabled
+                ):
+                    print(
+                        "[Pixal3D DINO SAFE FALLBACK] "
+                        f"layer_{layer_idx} normal path "
+                        f"produced {layer_bad} bad values; "
+                        "rerunning this layer safely"
+                    )
+
+                    torch.cuda.synchronize()
+
+                    del hidden_states
+                    torch.cuda.empty_cache()
+
+                    hidden_states = _safe_chunked_layer(
+                        layer_module,
+                        layer_input,
+                        position_embeddings,
+                        layer_idx,
+                    )
+
+                    recovered_bad = _cpu_bad_count(
+                        hidden_states
+                    )
+
+                    print(
+                        "[Pixal3D DINO SAFE FALLBACK] "
+                        f"layer_{layer_idx} recovery "
+                        f"bad={recovered_bad}"
+                    )
+
+                    if recovered_bad:
+                        raise RuntimeError(
+                            "[Pixal3D DINO SAFE FALLBACK] "
+                            f"layer_{layer_idx} could not "
+                            "be recovered"
+                        )
+
+                check_finite(
+                    f"layer_{layer_idx}",
+                    hidden_states,
+                )
+
+            final_norm_chunk = int(
+                os.environ.get(
+                    "TRELLIS2_DINO_SAFE_NORM_CHUNK",
+                    "64",
+                )
+            )
+
+            if getattr(self, "_pixal3d_official_final_norm", False):
+                # Match TencentARC/Pixal3D exactly.  This is intentionally
+                # parameterless: no self.model.norm.weight/bias are applied.
+                hidden_states = F.layer_norm(
+                    hidden_states.float(),
+                    hidden_states.shape[-1:],
+                )
+            elif hasattr(
+                self.model,
+                "norm",
+            ):
+                hidden_states = (
+                    _safe_layer_norm_token_chunks(
+                        self.model.norm,
+                        hidden_states,
+                        final_norm_chunk,
+                        "final_layer_norm",
+                    )
+                )
+            else:
+                # Compatibility fallback only.
+                final_parts = []
+
+                for _s in range(
+                    0,
+                    hidden_states.shape[1],
+                    final_norm_chunk,
+                ):
+                    _e = min(
+                        _s + final_norm_chunk,
+                        hidden_states.shape[1],
+                    )
+
+                    _x = (
+                        hidden_states[:, _s:_e]
+                        .contiguous()
+                        .float()
+                    )
+
+                    _scale = _x.abs().amax(
+                        dim=-1,
+                        keepdim=True,
+                    ).clamp_min(1.0)
+                    _xs = _x / _scale
+                    _mean = _xs.mean(
+                        dim=-1,
+                        keepdim=True,
+                    )
+
+                    _centered = (
+                        _xs - _mean
+                    )
+
+                    _var = (
+                        _centered
+                        .square()
+                        .mean(
+                            dim=-1,
+                            keepdim=True,
+                        )
+                    )
+
+                    _inv_scale = _scale.reciprocal()
+                    _part = (
+                        _centered
+                        * torch.rsqrt(
+                            _var.clamp_min(0.0)
+                            + 1e-5 * _inv_scale.square()
+                        )
+                    )
+
+                    _require_safe(
+                        "final_layer_norm."
+                        f"{_s}:{_e}",
+                        _part,
+                    )
+
+                    final_parts.append(
+                        _part
+                    )
+
+                hidden_states = torch.cat(
+                    final_parts,
+                    dim=1,
+                )
+
+            check_finite(
+                "final_layer_norm",
+                hidden_states,
+            )
+
+        return hidden_states
     
     def forward(
         self,
@@ -561,7 +2354,7 @@ class DinoV3ProjFeatureExtractor(nn.Module):
             
             # --- High-resolution branch (NAF): upsample then sample ---
             if self.use_naf_upsample:
-                self._load_naf()
+                self._load_naf(device=image_for_naf.device)
                 # NAF expects: guide [B, 3, H, W], lr_features [B, C, h, w], target_size (H', W')
                 lr_features_bchw = z_patchtokens_spatial.permute(0, 3, 1, 2)  # [B, D, h, w]
 
@@ -615,6 +2408,7 @@ class DinoV3ProjFeatureExtractor(nn.Module):
         transform_matrix: Optional[torch.Tensor],
         tile_factor: int,
     ) -> torch.Tensor:
+        self._load_naf(device=image_for_naf.device)  # ensure NAF is colocated with inputs
         """Streaming NAF + grid_sample. Materialises only one image-space tile of the NAF
         output at a time, capping the transient HR-feature-map peak. Returns the same
         [B, grid_res^3, embed_dim] tensor that proj_grid(naf_model(...)) would produce in
@@ -673,65 +2467,51 @@ class DinoV3ProjFeatureExtractor(nn.Module):
         embed_dim = lr_features_bchw.shape[1]
         z_proj_hr: Optional[torch.Tensor] = None
 
-        for ti in range(K):
-            for tj in range(K):
-                u_lo = -1.0 + 2.0 * tj / K
-                u_hi = -1.0 + 2.0 * (tj + 1) / K
-                v_lo = -1.0 + 2.0 * ti / K
-                v_hi = -1.0 + 2.0 * (ti + 1) / K
+        naf_core = _real_naf_core(self.naf_model)
+        if naf_core is None:
+            # Bilinear stand-in (DummyNAFModel): one untiled call is cheap and exact.
+            hr = self.naf_model(image_for_naf, lr_features_bchw, (naf_h, naf_w))
+            return sample_features(hr, image_points_norm).transpose(1, 2).contiguous()
 
-                # Half-open partition with the last tile inclusive on the right/bottom.
-                u_in = (u_global >= u_lo) & (u_global <= u_hi if tj == K - 1 else u_global < u_hi)
-                v_in = (v_global >= v_lo) & (v_global <= v_hi if ti == K - 1 else v_global < v_hi)
-                core_mask = u_in & v_in  # [B, R^3]
-                if not core_mask.any():
-                    continue
-
-                # Output (NAF) tile pixel bounds with halo, clamped to the full extent.
-                out_lo_y = max(0, int(round(naf_h * ti / K)) - HALO_OUT)
-                out_hi_y = min(naf_h, int(round(naf_h * (ti + 1) / K)) + HALO_OUT)
-                out_lo_x = max(0, int(round(naf_w * tj / K)) - HALO_OUT)
-                out_hi_x = min(naf_w, int(round(naf_w * (tj + 1) / K)) + HALO_OUT)
-                tile_out_h = out_hi_y - out_lo_y
-                tile_out_w = out_hi_x - out_lo_x
-
-                # Image (guide) tile pixel bounds with halo, clamped to the full extent.
-                img_lo_y = max(0, int(round(img_size * ti / K)) - halo_img)
-                img_hi_y = min(img_size, int(round(img_size * (ti + 1) / K)) + halo_img)
-                img_lo_x = max(0, int(round(img_size * tj / K)) - halo_img)
-                img_hi_x = min(img_size, int(round(img_size * (tj + 1) / K)) + halo_img)
-                image_tile = image_for_naf[:, :, img_lo_y:img_hi_y, img_lo_x:img_hi_x].contiguous()
-
-                tile_hr = self.naf_model(
-                    image_tile, lr_features_bchw, (tile_out_h, tile_out_w)
-                )  # [B, embed_dim, tile_out_h, tile_out_w]
-
-                if z_proj_hr is None:
-                    z_proj_hr = torch.zeros(
-                        B, R3, embed_dim,
-                        device=tile_hr.device, dtype=tile_hr.dtype,
+        # Exact row bands (see _naf_exact_bands). Each grid point goes to the one
+        # band whose core rows contain its projection.
+        for keep_lo, keep_hi, core_lo, core_hi, band_hr in _naf_exact_bands(
+            naf_core, image_for_naf, lr_features_bchw, (naf_h, naf_w), K
+        ):
+            if os.environ.get("TRELLIS2_PIXAL3D_MV_STRICT_NAF", "1") == "1":
+                # Counted on the host: the bytes that reach the conditioner.
+                band_bad = int((~torch.isfinite(band_hr.cpu())).sum())
+                if band_bad:
+                    raise RuntimeError(
+                        "[Pixal3D MV STRICT NAF] exact banded NAF produced "
+                        f"{band_bad} NaN/Inf values in rows {keep_lo}-{keep_hi}; "
+                        "refusing to substitute bilinear features because "
+                        "that changes the conditioning semantics"
                     )
 
-                # Tile's normalised bounds in the FULL feature map's [-1, 1] coord system.
-                tile_v_lo_n = 2.0 * out_lo_y / naf_h - 1.0
-                tile_v_hi_n = 2.0 * out_hi_y / naf_h - 1.0
-                tile_u_lo_n = 2.0 * out_lo_x / naf_w - 1.0
-                tile_u_hi_n = 2.0 * out_hi_x / naf_w - 1.0
+            v_lo = 2.0 * core_lo / naf_h - 1.0
+            v_hi = 2.0 * core_hi / naf_h - 1.0
+            last = core_hi == naf_h
+            core_mask = (v_global >= v_lo) & ((v_global <= v_hi) if last else (v_global < v_hi))
+            if not core_mask.any():
+                continue
 
-                # Per-batch sampling — core_mask varies across batch so we can't share an index.
-                for b in range(B):
-                    mask_b = core_mask[b]
-                    if not mask_b.any():
-                        continue
-                    pts = image_points_norm[b][mask_b]  # [N_core, 2] in global [-1, 1]
-                    local_u = 2.0 * (pts[..., 0] - tile_u_lo_n) / (tile_u_hi_n - tile_u_lo_n) - 1.0
-                    local_v = 2.0 * (pts[..., 1] - tile_v_lo_n) / (tile_v_hi_n - tile_v_lo_n) - 1.0
-                    local_pts = torch.stack([local_u, local_v], dim=-1).unsqueeze(0)  # [1, N_core, 2]
+            if z_proj_hr is None:
+                z_proj_hr = torch.zeros(B, R3, embed_dim, device=band_hr.device, dtype=band_hr.dtype)
 
-                    feats = sample_features(tile_hr[b:b + 1], local_pts)  # [1, C, N_core]
-                    z_proj_hr[b][mask_b] = feats.squeeze(0).transpose(0, 1).to(z_proj_hr.dtype)
-
-                del tile_hr, image_tile
+            # Band bounds in the FULL feature map's [-1, 1] coords; full width.
+            band_v_lo_n = 2.0 * keep_lo / naf_h - 1.0
+            band_v_hi_n = 2.0 * keep_hi / naf_h - 1.0
+            for b in range(B):
+                mask_b = core_mask[b]
+                if not mask_b.any():
+                    continue
+                pts = image_points_norm[b][mask_b]
+                local_v = 2.0 * (pts[..., 1] - band_v_lo_n) / (band_v_hi_n - band_v_lo_n) - 1.0
+                local_pts = torch.stack([pts[..., 0], local_v], dim=-1).unsqueeze(0)
+                feats = sample_features(band_hr[b:b + 1], local_pts)
+                z_proj_hr[b][mask_b] = feats.squeeze(0).transpose(0, 1).to(z_proj_hr.dtype)
+            del band_hr
 
         if z_proj_hr is None:
             # No grid point projected on-image at all (degenerate). Return zeros — same shape
@@ -1705,3 +3485,1493 @@ class ImageConditionedProjMixin:
             save_dir=save_dir,
             prefix=prefix,
         )
+
+
+# ============================================================================
+# Pixal3D MultiView compatibility
+# Backported from current ComfyUI-Trellis2 / Pixal3D MultiView implementation.
+# ============================================================================
+
+class ProjGridMV(ProjGrid):
+    """
+    Multi-view version of ProjGrid.
+
+    Unlike the old ProjGrid implementation this allows an explicit camera
+    transform for every view.
+    """
+
+    def forward(
+        self,
+        features_map: torch.Tensor,
+        camera_angle_x: torch.Tensor,
+        distance: torch.Tensor,
+        mesh_scale: torch.Tensor,
+        transform_matrix: Optional[torch.Tensor] = None,
+        BHWC: bool = True,
+    ) -> torch.Tensor:
+        """
+        Pixal3D MV projection.
+
+        On ROCm/gfx1030, bypass F.grid_sample for the huge
+        R^3 projected point set. We observed sporadic NaN
+        values from that path even when DINO/NAF features
+        and camera data were finite.
+
+        Manual bilinear sampling below implements
+        align_corners=False + padding_mode='border'.
+        """
+        if BHWC:
+            B, H, W, C = features_map.shape
+        else:
+            B, C, H, W = features_map.shape
+
+        is_rocm = (
+            getattr(torch.version, "hip", None)
+            is not None
+        )
+
+        # Keep projection math in FP32.
+        features_map = features_map.float()
+
+        # [Pixal3D pre-sampler CPU check]
+        fmap_finite = torch.isfinite(
+            features_map
+        )
+
+        fmap_finite_count = int(
+            fmap_finite
+            .detach()
+            .cpu()
+            .sum()
+            .item()
+        )
+
+        fmap_bad = (
+            features_map.numel()
+            - fmap_finite_count
+        )
+
+        if fmap_bad:
+            raise RuntimeError(
+                "[Pixal3D MV ROCm sampler] "
+                f"INPUT FEATURE MAP has {fmap_bad} "
+                "real NaN/Inf values BEFORE projection "
+                "(CPU-verified)"
+            )
+
+        grid_points = (
+            self.grid_points
+            .float()
+            .expand(B, -1, -1)
+        )
+
+        grid_points = (
+            grid_points
+            / mesh_scale.float()
+                .unsqueeze(-1)
+                .unsqueeze(-1)
+            / 2.0
+        )
+
+        if transform_matrix is None:
+            transform_matrix = (
+                self.front_view_transform_matrix
+                .float()
+                .expand(B, -1, -1)
+                .clone()
+            )
+
+            transform_matrix[:, 1, 3] = (
+                -distance.float()
+            )
+        else:
+            transform_matrix = (
+                transform_matrix.float()
+            )
+
+        image_points, depth, valid_mask = (
+            project_points_to_image_batch(
+                grid_points,
+                transform_matrix,
+                camera_angle_x.float(),
+                self.image_resolution,
+            )
+        )
+
+        image_points_norm = (
+            (image_points + 0.5)
+            / float(self.image_resolution)
+            * 2.0
+            - 1.0
+        )
+
+        coord_finite = torch.isfinite(
+            image_points_norm
+        )
+
+        coord_finite_count = int(
+            coord_finite
+            .detach()
+            .cpu()
+            .sum()
+            .item()
+        )
+
+        coord_bad = (
+            image_points_norm.numel()
+            - coord_finite_count
+        )
+
+        if coord_bad:
+            print(
+                "[Pixal3D MV ROCm sampler] "
+                f"projection coordinates contain "
+                f"{coord_bad} REAL NaN/Inf values "
+                "(CPU-verified); sanitizing"
+            )
+
+        # Always execute this. It is a no-op for finite values,
+        # and removes dependence on another ROCm reduction result.
+        image_points_norm = torch.nan_to_num(
+            image_points_norm,
+            nan=0.0,
+            posinf=1.0,
+            neginf=-1.0,
+        )
+
+        if BHWC:
+            fmap = (
+                features_map
+                .permute(0, 3, 1, 2)
+                .contiguous()
+            )
+        else:
+            fmap = features_map.contiguous()
+
+        if not is_rocm:
+            # Preserve upstream implementation elsewhere.
+            return sample_features(
+                fmap,
+                image_points_norm,
+            ).permute(0, 2, 1)
+
+        # =====================================================
+        # ROCm-safe manual bilinear sampler.
+        #
+        # Equivalent to:
+        #
+        # F.grid_sample(
+        #     fmap,
+        #     grid,
+        #     mode="bilinear",
+        #     align_corners=False,
+        #     padding_mode="border",
+        # )
+        #
+        # but avoids gfx1030 grid_sample instability.
+        # =====================================================
+
+        q = image_points_norm.float()
+
+        # padding_mode='border'
+        q = q.clamp(
+            min=-1.0,
+            max=1.0,
+        )
+
+        # align_corners=False conversion:
+        #
+        # pixel_x = ((ndc_x + 1) * W - 1) / 2
+        # pixel_y = ((ndc_y + 1) * H - 1) / 2
+        #
+        px = (
+            ((q[..., 0] + 1.0) * W - 1.0)
+            * 0.5
+        )
+
+        py = (
+            ((q[..., 1] + 1.0) * H - 1.0)
+            * 0.5
+        )
+
+        # Border behavior is equivalent to clamping the
+        # continuous pixel location.
+        px = px.clamp(
+            0.0,
+            float(W - 1),
+        )
+
+        py = py.clamp(
+            0.0,
+            float(H - 1),
+        )
+
+        x0 = torch.floor(px).long()
+        y0 = torch.floor(py).long()
+
+        x1 = (x0 + 1).clamp(
+            max=W - 1,
+        )
+
+        y1 = (y0 + 1).clamp(
+            max=H - 1,
+        )
+
+        wx = px - x0.float()
+        wy = py - y0.float()
+
+        fmap_flat = fmap.reshape(
+            B,
+            C,
+            H * W,
+        )
+
+        K = q.shape[1]
+
+        chunk = int(
+            os.environ.get(
+                "TRELLIS2_MV_PROJ_CHUNK",
+                "32768",
+            )
+        )
+
+        outputs = []
+
+        for start in range(0, K, chunk):
+            stop = min(
+                start + chunk,
+                K,
+            )
+
+            x0c = x0[:, start:stop]
+            x1c = x1[:, start:stop]
+            y0c = y0[:, start:stop]
+            y1c = y1[:, start:stop]
+
+            wxc = wx[:, start:stop]
+            wyc = wy[:, start:stop]
+
+            i00 = y0c * W + x0c
+            i10 = y0c * W + x1c
+            i01 = y1c * W + x0c
+            i11 = y1c * W + x1c
+
+            def gather(index):
+                return torch.gather(
+                    fmap_flat,
+                    2,
+                    index.unsqueeze(1).expand(
+                        -1,
+                        C,
+                        -1,
+                    ),
+                )
+
+            v00 = gather(i00)
+            v10 = gather(i10)
+            v01 = gather(i01)
+            v11 = gather(i11)
+
+            wxc = wxc.unsqueeze(1)
+            wyc = wyc.unsqueeze(1)
+
+            top = (
+                v00 * (1.0 - wxc)
+                + v10 * wxc
+            )
+
+            bottom = (
+                v01 * (1.0 - wxc)
+                + v11 * wxc
+            )
+
+            out_chunk = (
+                top * (1.0 - wyc)
+                + bottom * wyc
+            )
+
+            outputs.append(
+                out_chunk
+            )
+
+        sampled = torch.cat(
+            outputs,
+            dim=2,
+        )
+
+        out = sampled.permute(
+            0,
+            2,
+            1,
+        ).contiguous()
+
+        # [Pixal3D finite CPU]
+        #
+        # Do NOT reduce a huge bool tensor on gfx1030/ROCm here.
+        # We observed two consecutive finite.sum().item() calls
+        # disagreeing for the exact same mask.
+        #
+        # Compute isfinite elementwise on GPU, copy the mask, then
+        # perform the reduction once on CPU.
+        finite = torch.isfinite(out)
+        finite_cpu = finite.detach().cpu()
+
+        finite_count = int(
+            finite_cpu.sum().item()
+        )
+
+        bad = (
+            out.numel()
+            - finite_count
+        )
+
+        print(
+            "[Pixal3D MV ROCm sampler] "
+            f"manual bilinear: "
+            f"B={B}, C={C}, H={H}, W={W}, "
+            f"K={K}, chunk={chunk}, "
+            f"finite={finite_count}/"
+            f"{out.numel()}, "
+            f"bad={bad} "
+            f"[CPU-reduced]"
+        )
+
+        if bad:
+            raise RuntimeError(
+                "[Pixal3D MV ROCm sampler] "
+                f"manual projection has {bad} "
+                "real non-finite values "
+                "(CPU-verified)"
+            )
+
+        del finite_cpu
+
+        return out
+
+def compute_relative_calc_mat(
+    transform_matrix: torch.Tensor,
+    distance: torch.Tensor,
+    front_view_transform_matrix: torch.Tensor,
+) -> torch.Tensor:
+    """
+    calc_mat_i = F @ inv(C_0) @ C_i
+
+    This converts every camera into the coordinate frame of the main/front view.
+    """
+
+    B, V = transform_matrix.shape[:2]
+    device = transform_matrix.device
+
+    F_mat = (
+        front_view_transform_matrix
+        .to(device)
+        .unsqueeze(0)
+        .expand(B, -1, -1)
+        .clone()
+    )
+
+    F_mat[:, 1, 3] = -distance[:, 0]
+    F_mat = F_mat.unsqueeze(1)
+
+    C0 = transform_matrix[:, 0:1]
+
+    # ROCm linalg.inv should remain FP32.
+    with torch.amp.autocast("cuda", enabled=False):
+
+        C0f = (
+            C0.float()
+            .expand(B, V, 4, 4)
+            .reshape(B * V, 4, 4)
+        )
+
+        Cif = (
+            transform_matrix.float()
+            .reshape(B * V, 4, 4)
+        )
+
+        Ff = (
+            F_mat.float()
+            .expand(B, V, 4, 4)
+            .reshape(B * V, 4, 4)
+        )
+
+        relative = torch.bmm(
+            torch.linalg.inv(C0f),
+            Cif,
+        )
+
+        calc = torch.bmm(
+            Ff,
+            relative,
+        )
+
+    return calc.reshape(B, V, 4, 4)
+
+
+class DinoV3ProjMultiViewFeatureExtractor(
+    DinoV3ProjFeatureExtractor
+):
+    """
+    Pixal3D camera-aware multi-view DINOv3 projected conditioner.
+
+    Inputs:
+        image            [B,V,3,H,W]
+        camera_angle_x   [B,V]
+        distance         [B,V]
+        mesh_scale       [B]
+        transform_matrix [B,V,4,4]
+
+    average fusion keeps the projected feature layout compatible with the
+    existing Pixal3D denoisers/GGUF models.
+    """
+
+    def __init__(
+        self,
+        *args,
+        multiview_fusion: str = "average",
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+
+        if multiview_fusion not in (
+            "average",
+            "attention",
+        ):
+            raise ValueError(
+                "multiview_fusion must be "
+                "'average' or 'attention'"
+            )
+
+        self.multiview_fusion = multiview_fusion
+
+        # The official Pixal3D MV checkpoints were trained with the projected
+        # DINO extractor from TencentARC/Pixal3D, whose extract_features() ends
+        # with parameterless F.layer_norm rather than DINO model.norm.  Earlier
+        # ROCm patches accidentally matched this fork's learned-norm behavior
+        # instead of the released Pixal3D conditioner semantics.
+        self._pixal3d_official_final_norm = (
+            os.environ.get(
+                "TRELLIS2_PIXAL3D_OFFICIAL_DINO_NORM",
+                "1",
+            ) == "1"
+        )
+        if self._pixal3d_official_final_norm:
+            print(
+                "[Pixal3D MV DINO] official final normalization: "
+                "parameterless F.layer_norm (no learned DINO affine)"
+            )
+
+        self.proj_grid = ProjGridMV(
+            grid_resolution=self.grid_resolution,
+            image_resolution=self.image_size,
+        )
+
+
+    def _project_naf_cpu_bilinear_fallback(
+        self,
+        lr_features_bchw,
+        camera_angle_x_v,
+        distance_v,
+        mesh_scale_v,
+        calc_mat_v,
+    ):
+        """ROCm correctness fallback for a corrupted real-NAF output.
+
+        The real NAF/NATTEN path on gfx1030 can return a 1 GiB 512x512 feature
+        map with millions of NaN/Inf values.  Repairing that map in-place on
+        the GPU proved unsafe: later ROCm allocations/kernels can corrupt an
+        already-verified channel block again.
+
+        Instead, never construct or repair the giant fallback map on the GPU.
+        Upsample the finite DINO LR features on CPU in channel chunks, project
+        each chunk on CPU, concatenate the much smaller projected tensor, then
+        copy only that projected tensor back to the caller's device.
+        """
+        import torch.nn.functional as F
+
+        output_device = lr_features_bchw.device
+        target = self.naf_target_size
+        if isinstance(target, (tuple, list)):
+            H_hr, W_hr = int(target[0]), int(target[1])
+        else:
+            H_hr = W_hr = int(target)
+
+        channel_chunk = max(
+            1,
+            int(
+                os.environ.get(
+                    "TRELLIS2_MV_NAF_CPU_FALLBACK_CHUNK",
+                    os.environ.get("TRELLIS2_MV_NAF_REPAIR_CHUNK", "32"),
+                )
+            ),
+        )
+
+        lr_cpu = lr_features_bchw.detach().float().cpu().contiguous()
+        if not bool(torch.isfinite(lr_cpu).all().item()):
+            bad = lr_cpu.numel() - int(torch.isfinite(lr_cpu).sum().item())
+            raise RuntimeError(
+                "[Pixal3D MV NAF CPU fallback] LR DINO feature map contains "
+                f"{bad} NaN/Inf values"
+            )
+
+        # ProjGridMV only owns small coordinate buffers. Move those to CPU so
+        # projection and manual bilinear sampling cannot touch ROCm while the
+        # fallback is being built.
+        try:
+            proj_device = self.proj_grid.grid_points.device
+        except Exception:
+            proj_device = output_device
+
+        self.proj_grid.cpu()
+        projected_parts = []
+
+        try:
+            camera_cpu = camera_angle_x_v.detach().float().cpu()
+            distance_cpu = distance_v.detach().float().cpu()
+            mesh_scale_cpu = mesh_scale_v.detach().float().cpu()
+            calc_cpu = (
+                calc_mat_v.detach().float().cpu()
+                if calc_mat_v is not None
+                else None
+            )
+
+            C = int(lr_cpu.shape[1])
+            for c0 in range(0, C, channel_chunk):
+                c1 = min(c0 + channel_chunk, C)
+
+                fallback_cpu = F.interpolate(
+                    lr_cpu[:, c0:c1],
+                    size=(H_hr, W_hr),
+                    mode="bilinear",
+                    align_corners=False,
+                ).contiguous()
+
+                fallback_bad = fallback_cpu.numel() - int(
+                    torch.isfinite(fallback_cpu).sum().item()
+                )
+                if fallback_bad:
+                    raise RuntimeError(
+                        "[Pixal3D MV NAF CPU fallback] interpolated channels "
+                        f"{c0}:{c1} contain {fallback_bad} NaN/Inf values"
+                    )
+
+                projected_cpu = self.proj_grid(
+                    fallback_cpu,
+                    camera_cpu,
+                    distance_cpu,
+                    mesh_scale_cpu,
+                    calc_cpu,
+                    BHWC=False,
+                ).float().contiguous()
+
+                projected_bad = projected_cpu.numel() - int(
+                    torch.isfinite(projected_cpu).sum().item()
+                )
+                if projected_bad:
+                    raise RuntimeError(
+                        "[Pixal3D MV NAF CPU fallback] projected channels "
+                        f"{c0}:{c1} contain {projected_bad} NaN/Inf values"
+                    )
+
+                projected_parts.append(projected_cpu)
+                print(
+                    "[Pixal3D MV NAF CPU fallback] "
+                    f"channels={c0}:{c1}, projected finite"
+                )
+
+                del fallback_cpu
+
+            z_proj_hr_cpu = torch.cat(projected_parts, dim=-1).contiguous()
+            del projected_parts
+
+            final_bad = z_proj_hr_cpu.numel() - int(
+                torch.isfinite(z_proj_hr_cpu).sum().item()
+            )
+            if final_bad:
+                raise RuntimeError(
+                    "[Pixal3D MV NAF CPU fallback] final CPU projection contains "
+                    f"{final_bad} NaN/Inf values"
+                )
+
+            print(
+                "[Pixal3D MV NAF CPU fallback] complete: "
+                f"shape={tuple(z_proj_hr_cpu.shape)}, bad=0; "
+                f"copying projected tensor -> {output_device}"
+            )
+
+            return z_proj_hr_cpu.to(
+                device=output_device,
+                dtype=torch.float32,
+                non_blocking=False,
+            )
+        finally:
+            self.proj_grid.to(proj_device)
+
+    def _project_single_view(
+        self,
+        z_patchtokens_spatial,
+        image_for_naf,
+        camera_angle_x_v,
+        distance_v,
+        mesh_scale_v,
+        calc_mat_v,
+    ):
+        """
+        Project one Pixal3D MV view.
+
+        ROCm/gfx1030 fix:
+        - keep DINO projection in FP32
+        - force NAF model/input to FP32
+        - disable autocast around NAF
+        - if the pure-torch NATTEN fallback still creates
+          non-finite HR features, substitute the corresponding
+          upsampled finite DINO feature instead of propagating
+          NaN into the 1024 shape-flow model.
+        """
+        import torch.nn.functional as F
+
+        z_patchtokens_spatial = (
+            z_patchtokens_spatial.float()
+        )
+
+        z_proj_lr = self.proj_grid(
+            z_patchtokens_spatial,
+            camera_angle_x_v.float(),
+            distance_v.float(),
+            mesh_scale_v.float(),
+            calc_mat_v.float(),
+        ).float()
+
+        lr_finite = torch.isfinite(
+            z_proj_lr
+        )
+
+        lr_finite_count = int(
+            lr_finite
+            .detach()
+            .cpu()
+            .sum()
+            .item()
+        )
+
+        lr_bad = (
+            z_proj_lr.numel()
+            - lr_finite_count
+        )
+
+        if lr_bad:
+            raise RuntimeError(
+                "[Pixal3D MV NAF finite] "
+                f"DINO LR projection has {lr_bad} "
+                "real non-finite values "
+                "(CPU-verified)"
+            )
+
+        if not self.use_naf_upsample:
+            return z_proj_lr
+
+        lr_features_bchw = (
+            z_patchtokens_spatial
+            .permute(0, 3, 1, 2)
+            .contiguous()
+            .float()
+        )
+
+        image_for_naf = (
+            image_for_naf
+            .contiguous()
+            .float()
+        )
+
+        is_rocm = (
+            getattr(torch.version, "hip", None)
+            is not None
+        )
+
+        strict_official_naf = (
+            os.environ.get(
+                "TRELLIS2_PIXAL3D_MV_STRICT_NAF",
+                "1",
+            ) == "1"
+        )
+        strict_rocm_1024_naf = (
+            strict_official_naf
+            and is_rocm
+            and int(getattr(self, "image_size", 0)) >= 1024
+        )
+
+        force_cpu_fallback = (
+            is_rocm
+            and not strict_rocm_1024_naf
+            and (
+                getattr(self, "_rocm_naf_force_cpu_fallback", False)
+                or (
+                    int(getattr(self, "image_size", 0)) >= 1024
+                    and os.environ.get(
+                        "TRELLIS2_MV_NAF_1024_CPU_FALLBACK",
+                        "1",
+                    ) == "1"
+                )
+            )
+        )
+
+        if strict_rocm_1024_naf and not getattr(
+            self, "_trellis2_strict_naf1024_logged", False
+        ):
+            print(
+                "[Pixal3D MV STRICT NAF] 1024 ROCm conditioner: "
+                "bilinear semantic fallback DISABLED; running real NAF "
+                "in spatial tiles and failing hard on NaN/Inf"
+            )
+            self._trellis2_strict_naf1024_logged = True
+
+        # gfx1030 correctness mode: the real NAF/NATTEN 1024 path has been
+        # observed to return ~49% NaN/Inf while its DINO input is fully finite.
+        # Skip that known-bad GPU kernel by default for 1024 conditioners.
+        if (
+            force_cpu_fallback
+            and int(getattr(self, "image_size", 0)) >= 1024
+            and not getattr(self, "_trellis2_naf1024_cpu_logged", False)
+        ):
+            print(
+                "[Pixal3D MV NAF CPU fallback] gfx1030 1024 correctness mode: "
+                "skipping real NAF/NATTEN; using CPU bilinear projection"
+            )
+            self._trellis2_naf1024_cpu_logged = True
+
+        # Once real NAF has emitted a corrupt feature map, do not move it back
+        # to the GPU on subsequent views.  The CPU fallback does not need NAF.
+        if not force_cpu_fallback:
+            self._load_naf(device=image_for_naf.device)
+
+        if is_rocm and not force_cpu_fallback:
+            # RX 6800 / gfx1030:
+            # do not leave NAF parameters in BF16.
+            self.naf_model.float()
+
+        requested_K = getattr(
+            self,
+            "naf_tile_factor",
+            1,
+        ) or 1
+
+        # Strict Pixal3D MV correctness mode must not replace the learned NAF
+        # conditioner with a bilinear resize.  On ROCm, run the real NAF in
+        # spatial tiles instead.  The tile factor is deliberately independent
+        # of the old TRELLIS2_MV_NAF_TILING=0 launcher knob so old launchers
+        # cannot silently re-enable the geometry-destroying approximation.
+        if strict_rocm_1024_naf:
+            K = max(
+                2,
+                int(os.environ.get(
+                    "TRELLIS2_MV_NAF_1024_TILE_FACTOR",
+                    "4",
+                )),
+            )
+            self.naf_tile_factor = K
+        elif (
+            is_rocm
+            and os.environ.get(
+                "TRELLIS2_MV_NAF_TILING",
+                "0",
+            ) == "0"
+        ):
+            K = 1
+            self.naf_tile_factor = 1
+        else:
+            K = requested_K
+
+        # CPU fallback is intentionally non-tiled.  It already bounds peak
+        # memory by channel chunks, and must not enter _proj_naf_tiled() when
+        # real NAF was never loaded.
+        if force_cpu_fallback:
+            K = 1
+            self.naf_tile_factor = 1
+
+        print(
+            "[Pixal3D MV NAF] "
+            f"tile_factor requested={requested_K}, "
+            f"effective={K}"
+        )
+
+        if K <= 1:
+            if force_cpu_fallback:
+                print(
+                    "[Pixal3D MV NAF CPU fallback] "
+                    "real NAF was disabled after an earlier non-finite output; "
+                    "using deterministic CPU bilinear projection"
+                )
+                z_proj_hr = self._project_naf_cpu_bilinear_fallback(
+                    lr_features_bchw,
+                    camera_angle_x_v,
+                    distance_v,
+                    mesh_scale_v,
+                    calc_mat_v,
+                )
+            else:
+                # Explicitly suppress autocast around real NAF.
+                with torch.autocast(
+                    device_type="cuda",
+                    enabled=False,
+                ):
+                    hr_features = self.naf_model(
+                        image_for_naf,
+                        lr_features_bchw,
+                        self.naf_target_size,
+                    )
+
+                hr_features = hr_features.float()
+
+                # Count on CPU in channel chunks.  Do not trust a giant ROCm
+                # reduction when the NAF output itself may already be corrupt.
+                repair_chunk = max(
+                    1,
+                    int(
+                        os.environ.get(
+                            "TRELLIS2_MV_NAF_REPAIR_CHUNK",
+                            "32",
+                        )
+                    ),
+                )
+
+                B_hr, C_hr, H_hr, W_hr = hr_features.shape
+                hr_finite_count = 0
+                for c0 in range(0, C_hr, repair_chunk):
+                    c1 = min(c0 + repair_chunk, C_hr)
+                    chunk_mask_cpu = (
+                        torch.isfinite(hr_features[:, c0:c1])
+                        .detach()
+                        .cpu()
+                    )
+                    hr_finite_count += int(chunk_mask_cpu.sum().item())
+                    del chunk_mask_cpu
+
+                hr_bad = hr_features.numel() - hr_finite_count
+                print(
+                    "[Pixal3D MV NAF finite] "
+                    f"NAF output shape={tuple(hr_features.shape)}, "
+                    f"finite={hr_finite_count}/{hr_features.numel()}, "
+                    f"bad={hr_bad} [CPU-reduced]"
+                )
+
+                auto_cpu_fallback = (
+                    is_rocm
+                    and os.environ.get(
+                        "TRELLIS2_MV_NAF_AUTO_CPU_FALLBACK",
+                        "1",
+                    ) == "1"
+                )
+
+                if hr_bad and auto_cpu_fallback:
+                    bad_ratio = float(hr_bad) / float(hr_features.numel())
+                    print(
+                        "[Pixal3D MV NAF CPU fallback] "
+                        f"real NAF returned {hr_bad} NaN/Inf values "
+                        f"({bad_ratio:.2%}); discarding the corrupt 512x512 map "
+                        "instead of repairing it in-place on ROCm"
+                    )
+
+                    # Once a fresh real-NAF invocation has produced a corrupt
+                    # result, do not run it again for the remaining views of
+                    # this conditioner instance.  The source LR DINO features
+                    # are finite, so the deterministic bilinear projection is
+                    # a safe semantic fallback already supported by this file.
+                    self._rocm_naf_force_cpu_fallback = True
+
+                    del hr_features
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    try:
+                        self.naf_model.cpu()
+                    except Exception as _naf_offload_error:
+                        print(
+                            "[Pixal3D MV NAF CPU fallback] "
+                            "NAF CPU offload warning: "
+                            + repr(_naf_offload_error)
+                        )
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+                    z_proj_hr = self._project_naf_cpu_bilinear_fallback(
+                        lr_features_bchw,
+                        camera_angle_x_v,
+                        distance_v,
+                        mesh_scale_v,
+                        calc_mat_v,
+                    )
+                elif hr_bad:
+                    raise RuntimeError(
+                        "[Pixal3D MV NAF finite] real NAF returned "
+                        f"{hr_bad} NaN/Inf values and automatic CPU fallback "
+                        "is disabled (TRELLIS2_MV_NAF_AUTO_CPU_FALLBACK=0)"
+                    )
+                else:
+                    z_proj_hr = self.proj_grid(
+                        hr_features,
+                        camera_angle_x_v.float(),
+                        distance_v.float(),
+                        mesh_scale_v.float(),
+                        calc_mat_v.float(),
+                        BHWC=False,
+                    ).float()
+                    del hr_features
+
+        else:
+            # Retain existing tiled implementation for non-ROCm
+            # or explicit experimentation. Your launcher uses K=1.
+            z_proj_hr = self._proj_naf_tiled(
+                image_for_naf,
+                lr_features_bchw,
+                camera_angle_x_v.float(),
+                distance_v.float(),
+                mesh_scale_v.float(),
+                calc_mat_v.float(),
+                tile_factor=int(K),
+            ).float()
+
+        proj_mask = torch.isfinite(
+            z_proj_hr
+        )
+
+        proj_finite_count = int(
+            proj_mask
+            .detach()
+            .cpu()
+            .sum()
+            .item()
+        )
+
+        proj_bad = (
+            z_proj_hr.numel()
+            - proj_finite_count
+        )
+
+        print(
+            "[Pixal3D MV NAF finite] "
+            f"HR projection finite="
+            f"{proj_finite_count}/"
+            f"{z_proj_hr.numel()}, "
+            f"bad={proj_bad} "
+            f"[CPU-reduced]"
+        )
+
+        if proj_bad:
+            # Both branches use the same semantic channels and
+            # projection coordinates. Use LR projection only at
+            # corrupted HR elements.
+            z_proj_hr = torch.where(
+                proj_mask,
+                z_proj_hr,
+                z_proj_lr,
+            )
+
+            print(
+                "[Pixal3D MV NAF finite] "
+                f"repaired {proj_bad} projected "
+                "HR values from LR projection"
+            )
+
+        out = torch.cat(
+            [
+                z_proj_lr,
+                z_proj_hr,
+            ],
+            dim=-1,
+        )
+
+        combined_mask = torch.isfinite(
+            out
+        )
+
+        combined_finite_count = int(
+            combined_mask
+            .detach()
+            .cpu()
+            .sum()
+            .item()
+        )
+
+        combined_bad = (
+            out.numel()
+            - combined_finite_count
+        )
+
+        print(
+            "[Pixal3D MV NAF finite] "
+            f"combined finite="
+            f"{combined_finite_count}/"
+            f"{out.numel()}, "
+            f"bad={combined_bad} "
+            f"[CPU-reduced]"
+        )
+
+        if combined_bad:
+            raise RuntimeError(
+                "[Pixal3D MV NAF finite] "
+                f"combined projection has "
+                f"{combined_bad} real non-finite "
+                "values (CPU-verified)"
+            )
+
+        return out
+
+    def forward(
+        self,
+        image: torch.Tensor,
+        camera_angle_x: Optional[torch.Tensor] = None,
+        distance: Optional[torch.Tensor] = None,
+        mesh_scale: Optional[torch.Tensor] = None,
+        transform_matrix: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+
+        if image.ndim != 5:
+            raise ValueError(
+                "Pixal3D MultiView expects "
+                f"[B,V,3,H,W], got {tuple(image.shape)}"
+            )
+
+        B, V = image.shape[:2]
+
+        if (
+            camera_angle_x is None
+            or distance is None
+            or mesh_scale is None
+            or transform_matrix is None
+        ):
+            raise ValueError(
+                "Pixal3D MultiView requires "
+                "camera_angle_x, distance, mesh_scale "
+                "and transform_matrix"
+            )
+
+        calc_mat = compute_relative_calc_mat(
+            transform_matrix,
+            distance,
+            self.proj_grid.front_view_transform_matrix,
+        )
+
+
+        # ========================================================
+        # Pixal3D MV runtime camera validation.
+        # ========================================================
+        import os as _os
+
+        if _os.environ.get(
+            "TRELLIS2_MV_CAMERA_DEBUG", "0"
+        ) == "1":
+
+            _tm = transform_matrix.detach().float().cpu()
+            _dist = distance.detach().float().cpu()
+            _fov = camera_angle_x.detach().float().cpu()
+            _calc = calc_mat.detach().float().cpu()
+
+            print(
+                "[Pixal3D MV camera-debug] "
+                f"B={B}, V={V}"
+            )
+
+            print(
+                "[Pixal3D MV camera-debug] FOV deg="
+                + str(torch.rad2deg(_fov[0]).tolist())
+            )
+
+            print(
+                "[Pixal3D MV camera-debug] distance="
+                + str(_dist[0].tolist())
+            )
+
+            try:
+                _ms = mesh_scale.detach().float().cpu()
+                print(
+                    "[Pixal3D MV camera-debug] mesh_scale="
+                    + str(_ms.tolist())
+                )
+            except Exception:
+                print(
+                    "[Pixal3D MV camera-debug] mesh_scale="
+                    + str(mesh_scale)
+                )
+
+            _eyes = _tm[0, :, :3, 3]
+
+            print(
+                "[Pixal3D MV camera-debug] camera positions:"
+            )
+
+            for _i in range(V):
+                print(
+                    f"  C{_i} eye={_eyes[_i].tolist()}"
+                )
+
+            for _i in range(V):
+                _R = _tm[0, _i, :3, :3]
+
+                _orth_err = float(
+                    (
+                        _R.T @ _R
+                        - torch.eye(3)
+                    )
+                    .abs()
+                    .max()
+                    .item()
+                )
+
+                _det = float(
+                    torch.det(_R).item()
+                )
+
+                print(
+                    "[Pixal3D MV camera-debug] "
+                    f"C{_i}: det={_det:.6f}, "
+                    f"orth_err={_orth_err:.3e}"
+                )
+
+            _F = (
+                self.proj_grid
+                .front_view_transform_matrix
+                .detach()
+                .float()
+                .cpu()
+                .clone()
+            )
+
+            _F[1, 3] = -_dist[0, 0]
+
+            _front_err = float(
+                (_tm[0, 0] - _F)
+                .abs()
+                .max()
+                .item()
+            )
+
+            print(
+                "[Pixal3D MV camera-debug] "
+                f"canonical front max_err={_front_err:.6e}"
+            )
+
+            print(
+                "[Pixal3D MV camera-debug] "
+                "transform matrices:"
+            )
+
+            for _i in range(V):
+                print(f"  C[{_i}]=")
+                print(_tm[0, _i])
+
+            print(
+                "[Pixal3D MV camera-debug] "
+                "relative calc matrices:"
+            )
+
+            for _i in range(V):
+                print(f"  calc[{_i}]=")
+                print(_calc[0, _i])
+
+            if V == 4:
+                _d = float(_dist[0, 0])
+
+                _expected = torch.tensor(
+                    [
+                        [0.0, -_d, 0.0],
+                        [_d, 0.0, 0.0],
+                        [0.0, _d, 0.0],
+                        [-_d, 0.0, 0.0],
+                    ],
+                    dtype=torch.float32,
+                )
+
+                _eye_err = (
+                    _eyes - _expected
+                ).abs().max(dim=1).values
+
+                print(
+                    "[Pixal3D MV camera-debug] "
+                    "expected orbit order=az0,az90,az180,az270"
+                )
+
+                print(
+                    "[Pixal3D MV camera-debug] "
+                    "orbit eye max_err="
+                    + str(_eye_err.tolist())
+                )
+
+            if _os.environ.get(
+                "TRELLIS2_MV_CAMERA_DEBUG_STOP", "0"
+            ) == "1":
+                raise RuntimeError(
+                    "[Pixal3D MV camera-debug] "
+                    "debug-only stop requested"
+                )
+
+        # Run DINO in one B*V batch.
+        img_flat = image.reshape(
+            B * V,
+            *image.shape[2:],
+        )
+
+        if self.use_naf_upsample:
+            image_for_naf = img_flat.clone()
+
+        img_norm = self.transform(img_flat)
+
+        with torch.no_grad():
+
+            # Low-VRAM MultiView DINO extraction.
+            #
+            # At 1024 resolution, flattening all V views into B*V and
+            # evaluating DINO attention in one call can require several GiB
+            # of transient SDPA workspace on ROCm.  Extract the same features
+            # in small view batches, then concatenate them.  This does not
+            # change MV fusion or projection semantics.
+            _mv_total = int(img_norm.shape[0])
+            _default_chunk = 1 if is_amd_gpu else _mv_total
+            _dino_chunk = int(
+                os.environ.get(
+                    "TRELLIS2_MV_DINO_CHUNK",
+                    str(_default_chunk),
+                )
+            )
+            _dino_chunk = max(1, min(_dino_chunk, _mv_total))
+
+            # gfx1030 only needs DINO chunking for the 1024 stages.
+            # Keep 512 SS / Shape-512 on the original full-view batch.
+            if int(self.image_size) < 1024:
+                if _dino_chunk != _mv_total:
+                    print(
+                        "[Pixal3D MV DINO] 512 stage: "
+                        "using full-view batch"
+                    )
+                _dino_chunk = _mv_total
+
+            if _dino_chunk < _mv_total:
+                print(
+                    f"[Pixal3D MV DINO] chunked extraction: "
+                    f"{_mv_total} view(s), chunk={_dino_chunk}, "
+                    f"image={tuple(img_norm.shape[-2:])}"
+                )
+
+                # On ROCm 1024, keep completed view features on CPU while the
+                # next view runs.  This both reduces VRAM pressure and prevents
+                # a bad later kernel from silently overwriting a previous
+                # view's output allocation.
+                _isolate_parts_cpu = (
+                    getattr(torch.version, "hip", None) is not None
+                    and int(self.image_size) >= 1024
+                    and os.environ.get(
+                        "TRELLIS2_DINO_ISOLATE_VIEW_OUTPUTS",
+                        "1",
+                    ) == "1"
+                )
+
+                if _isolate_parts_cpu:
+                    print(
+                        "[Pixal3D MV DINO] ROCm view isolation: "
+                        "completed DINO outputs are stashed on CPU"
+                    )
+
+                _z_parts = []
+                for _mv_start in range(0, _mv_total, _dino_chunk):
+                    _mv_end = min(
+                        _mv_start + _dino_chunk,
+                        _mv_total,
+                    )
+
+                    _retry_count = max(
+                        0,
+                        int(
+                            os.environ.get(
+                                "TRELLIS2_DINO_VIEW_RETRIES",
+                                "1",
+                            )
+                        ),
+                    )
+
+                    for _attempt in range(_retry_count + 1):
+                        try:
+                            _z_part = self.extract_features(
+                                img_norm[_mv_start:_mv_end]
+                            )
+                            break
+                        except RuntimeError as _exc:
+                            _is_dino_failure = (
+                                "[Pixal3D DINO" in str(_exc)
+                            )
+                            if (
+                                not _is_dino_failure
+                                or _attempt >= _retry_count
+                            ):
+                                raise
+
+                            print(
+                                "[Pixal3D MV DINO] view chunk "
+                                f"{_mv_start}:{_mv_end} failed on "
+                                f"attempt {_attempt + 1}; restoring the "
+                                "pristine model and retrying once: "
+                                f"{_exc}"
+                            )
+
+                            if torch.cuda.is_available():
+                                torch.cuda.synchronize()
+                                torch.cuda.empty_cache()
+
+                    if _isolate_parts_cpu:
+                        _z_parts.append(
+                            _z_part.detach().to(
+                                device="cpu",
+                                dtype=torch.float32,
+                            ).clone()
+                        )
+                        del _z_part
+                    else:
+                        _z_parts.append(_z_part)
+
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                        torch.cuda.empty_cache()
+
+                z = torch.cat(_z_parts, dim=0)
+
+                if _isolate_parts_cpu:
+                    z = z.to(
+                        device=img_norm.device,
+                        dtype=torch.float32,
+                    )
+
+                del _z_parts
+            else:
+                z = self.extract_features(img_norm)
+
+            z_clstoken = z[:, 0:1]
+
+            num_reg = getattr(
+                self.model.config,
+                "num_register_tokens",
+                4,
+            )
+
+            z_regtokens = z[:, 1:1 + num_reg]
+            z_patchtokens = z[:, 1 + num_reg:]
+
+            z_patchtokens_spatial = (
+                z_patchtokens.reshape(
+                    B * V,
+                    self.patch_number,
+                    self.patch_number,
+                    -1,
+                )
+            )
+
+            camera_angle_x_flat = (
+                camera_angle_x.reshape(B * V)
+            )
+
+            distance_flat = (
+                distance.reshape(B * V)
+            )
+
+            mesh_scale_flat = (
+                mesh_scale[:, None]
+                .expand(B, V)
+                .reshape(B * V)
+            )
+
+            calc_mat_flat = (
+                calc_mat.reshape(
+                    B * V,
+                    4,
+                    4,
+                )
+            )
+
+            average = (
+                self.multiview_fusion
+                == "average"
+            )
+
+            z_proj_acc = None
+
+            per_view_proj = (
+                [] if not average else None
+            )
+
+            # Do projection per view to keep VRAM peak bounded.
+            for v in range(V):
+
+                idx = torch.arange(
+                    v,
+                    B * V,
+                    V,
+                    device=z.device,
+                )
+
+                img_naf_v = (
+                    image_for_naf[idx]
+                    if self.use_naf_upsample
+                    else None
+                )
+
+                z_view = self._project_single_view(
+                    z_patchtokens_spatial[idx],
+                    img_naf_v,
+                    camera_angle_x_flat[idx],
+                    distance_flat[idx],
+                    mesh_scale_flat[idx],
+                    calc_mat_flat[idx],
+                )
+
+                if average:
+                    if z_proj_acc is None:
+                        z_proj_acc = (
+                            z_view.contiguous()
+                        )
+                    else:
+                        z_proj_acc.add_(z_view)
+                        del z_view
+                else:
+                    per_view_proj.append(
+                        z_view
+                    )
+
+            z_global_all = torch.cat(
+                [
+                    z_clstoken,
+                    z_regtokens,
+                ],
+                dim=1,
+            )
+
+            z_global_all = (
+                z_global_all.reshape(
+                    B,
+                    V,
+                    z_global_all.shape[-2],
+                    z_global_all.shape[-1],
+                )
+            )
+
+            if average:
+                z_proj = z_proj_acc.div_(V)
+
+                z_global = (
+                    z_global_all.mean(
+                        dim=1
+                    )
+                )
+
+            else:
+                z_proj = torch.stack(
+                    per_view_proj,
+                    dim=2,
+                )
+
+                z_global = (
+                    z_global_all.reshape(
+                        B,
+                        V * z_global_all.shape[2],
+                        z_global_all.shape[3],
+                    )
+                )
+
+        return z_global, z_proj
+
+
