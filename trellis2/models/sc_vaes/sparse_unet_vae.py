@@ -704,6 +704,12 @@ class SparseUnetVaeDecoder(nn.Module):
             else:
                 return h
     
+    def _tiled_upsample(self, x, upsample_times, tile_size=None, overlap=None, **kwargs):
+        # GGUF-fork compatibility shim: this upstream build has no tiled upsample,
+        # so delegate to the regular (non-tiled) upsample. Correct result, just not
+        # memory-tiled. tile_size/overlap are accepted and ignored.
+        return self.upsample(x, upsample_times)
+
     def upsample(self, x: sp.SparseTensor, upsample_times: int) -> torch.Tensor:
         assert self.pred_subdiv == True, "Only decoders with pred_subdiv=True can be used with upsampling"
         
